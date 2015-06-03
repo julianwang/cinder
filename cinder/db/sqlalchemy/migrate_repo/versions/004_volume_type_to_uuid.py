@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -14,9 +12,11 @@
 
 import uuid
 
-from cinder.openstack.common import log as logging
 from migrate import ForeignKeyConstraint
+from oslo_log import log as logging
 from sqlalchemy import Integer, MetaData, String, Table
+
+from cinder.i18n import _LI
 
 LOG = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def upgrade(migrate_engine):
                                         name=fkey_name)
             try:
                 fkey.create()
-                LOG.info('Created foreign key %s' % fkey_name)
+                LOG.info(_LI('Created foreign key %s'), fkey_name)
             except Exception:
                 if migrate_engine.url.get_dialect().name.startswith('sqlite'):
                     pass
@@ -134,9 +134,20 @@ def downgrade(migrate_engine):
 
         new_id += 1
 
-    volumes.c.volume_type_id.alter(Integer)
-    volume_types.c.id.alter(Integer)
-    extra_specs.c.volume_type_id.alter(Integer)
+    if migrate_engine.name == 'postgresql':
+        # NOTE(e0ne): PostgreSQL can't cast string to int automatically
+        table_column_pairs = [('volumes', 'volume_type_id'),
+                              ('volume_types', 'id'),
+                              ('volume_type_extra_specs', 'volume_type_id')]
+        sql = 'ALTER TABLE {0} ALTER COLUMN {1} ' + \
+            'TYPE INTEGER USING {1}::numeric'
+
+        for table, column in table_column_pairs:
+            migrate_engine.execute(sql.format(table, column))
+    else:
+        volumes.c.volume_type_id.alter(Integer)
+        volume_types.c.id.alter(Integer)
+        extra_specs.c.volume_type_id.alter(Integer)
 
     for column in fkey_remove_list:
         fkeys = list(column.foreign_keys)
@@ -147,7 +158,7 @@ def downgrade(migrate_engine):
                                         name=fkey_name)
             try:
                 fkey.create()
-                LOG.info('Created foreign key %s' % fkey_name)
+                LOG.info(_LI('Created foreign key %s'), fkey_name)
             except Exception:
                 if migrate_engine.url.get_dialect().name.startswith('sqlite'):
                     pass

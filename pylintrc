@@ -16,7 +16,7 @@ variable-rgx=[a-z_][a-z0-9_]{0,30}$
 argument-rgx=[a-z_][a-z0-9_]{1,30}$
 
 # Method names should be at least 3 characters long
-# and be lowecased with underscores
+# and be lowercased with underscores
 method-rgx=([a-z_][a-z0-9_]{2,50}|setUp|tearDown)$
 
 # Module names matching cinder-* are ok (files in bin/)
@@ -32,7 +32,4 @@ max-args=6
 
 [Variables]
 
-# List of additional names supposed to be defined in builtins. Remember that
-# you should avoid to define new builtins when possible.
-# _ is used by our localization
-additional-builtins=_
+dummy-variables-rgx=_

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
@@ -20,25 +18,28 @@
 """Generic Node base class for all workers that run on hosts."""
 
 
-import errno
 import inspect
 import os
 import random
-import signal
-import sys
-import time
 
-import eventlet
-import greenlet
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_db import exception as db_exc
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_utils import importutils
+import osprofiler.notifier
+from osprofiler import profiler
+import osprofiler.web
 
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import rpc
-from cinder import utils
+from cinder.i18n import _, _LE, _LI, _LW
+from cinder.objects import base as objects_base
+from cinder.openstack.common import loopingcall
+from cinder.openstack.common import service
+from cinder import rpc
 from cinder import version
 from cinder import wsgi
 
@@ -48,288 +49,59 @@ LOG = logging.getLogger(__name__)
 service_opts = [
     cfg.IntOpt('report_interval',
                default=10,
-               help='seconds between nodes reporting state to datastore'),
+               help='Interval, in seconds, between nodes reporting state '
+                    'to datastore'),
     cfg.IntOpt('periodic_interval',
                default=60,
-               help='seconds between running periodic tasks'),
+               help='Interval, in seconds, between running periodic tasks'),
     cfg.IntOpt('periodic_fuzzy_delay',
                default=60,
-               help='range of seconds to randomly delay when starting the'
+               help='Range, in seconds, to randomly delay when starting the'
                     ' periodic task scheduler to reduce stampeding.'
                     ' (Disable by setting to 0)'),
     cfg.StrOpt('osapi_volume_listen',
                default="0.0.0.0",
-               help='IP address for OpenStack Volume API to listen'),
+               help='IP address on which OpenStack Volume API listens'),
     cfg.IntOpt('osapi_volume_listen_port',
                default=8776,
-               help='port for os volume api to listen'), ]
+               help='Port on which OpenStack Volume API listens'),
+    cfg.IntOpt('osapi_volume_workers',
+               help='Number of workers for OpenStack Volume API service. '
+                    'The default is equal to the number of CPUs available.'), ]
+
+profiler_opts = [
+    cfg.BoolOpt("profiler_enabled", default=False,
+                help=_('If False fully disable profiling feature.')),
+    cfg.BoolOpt("trace_sqlalchemy", default=False,
+                help=_("If False doesn't trace SQL requests."))
+]
 
 CONF = cfg.CONF
 CONF.register_opts(service_opts)
+CONF.register_opts(profiler_opts, group="profiler")
 
 
-class SignalExit(SystemExit):
-    def __init__(self, signo, exccode=1):
-        super(SignalExit, self).__init__(exccode)
-        self.signo = signo
+def setup_profiler(binary, host):
+    if CONF.profiler.profiler_enabled:
+        _notifier = osprofiler.notifier.create(
+            "Messaging", messaging, context.get_admin_context().to_dict(),
+            rpc.TRANSPORT, "cinder", binary, host)
+        osprofiler.notifier.set(_notifier)
+        LOG.warning(
+            _LW("OSProfiler is enabled.\nIt means that person who knows "
+                "any of hmac_keys that are specified in "
+                "/etc/cinder/api-paste.ini can trace his requests. \n"
+                "In real life only operator can read this file so there "
+                "is no security issue. Note that even if person can "
+                "trigger profiler, only admin user can retrieve trace "
+                "information.\n"
+                "To disable OSprofiler set in cinder.conf:\n"
+                "[profiler]\nenabled=false"))
+    else:
+        osprofiler.web.disable()
 
 
-class Launcher(object):
-    """Launch one or more services and wait for them to complete."""
-
-    def __init__(self):
-        """Initialize the service launcher.
-
-        :returns: None
-
-        """
-        self._services = []
-
-    @staticmethod
-    def run_server(server):
-        """Start and wait for a server to finish.
-
-        :param service: Server to run and wait for.
-        :returns: None
-
-        """
-        server.start()
-        server.wait()
-
-    def launch_server(self, server):
-        """Load and start the given server.
-
-        :param server: The server you would like to start.
-        :returns: None
-
-        """
-        gt = eventlet.spawn(self.run_server, server)
-        self._services.append(gt)
-
-    def stop(self):
-        """Stop all services which are currently running.
-
-        :returns: None
-
-        """
-        for service in self._services:
-            service.kill()
-
-    def wait(self):
-        """Waits until all services have been stopped, and then returns.
-
-        :returns: None
-
-        """
-        def sigterm(sig, frame):
-            LOG.audit(_("SIGTERM received"))
-            # NOTE(jk0): Raise a ^C which is caught by the caller and cleanly
-            # shuts down the service. This does not yet handle eventlet
-            # threads.
-            raise KeyboardInterrupt
-
-        signal.signal(signal.SIGTERM, sigterm)
-
-        for service in self._services:
-            try:
-                service.wait()
-            except greenlet.GreenletExit:
-                pass
-
-
-class ServerWrapper(object):
-    def __init__(self, server, workers):
-        self.server = server
-        self.workers = workers
-        self.children = set()
-        self.forktimes = []
-        self.failed = False
-
-
-class ProcessLauncher(object):
-    def __init__(self):
-        self.children = {}
-        self.sigcaught = None
-        self.totalwrap = 0
-        self.failedwrap = 0
-        self.running = True
-        rfd, self.writepipe = os.pipe()
-        self.readpipe = eventlet.greenio.GreenPipe(rfd, 'r')
-
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-
-    def _handle_signal(self, signo, frame):
-        self.sigcaught = signo
-        self.running = False
-
-        # Allow the process to be killed again and die from natural causes
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-    def _pipe_watcher(self):
-        # This will block until the write end is closed when the parent
-        # dies unexpectedly
-        self.readpipe.read()
-
-        LOG.info(_('Parent process has died unexpectedly, exiting'))
-
-        sys.exit(1)
-
-    def _child_process(self, server):
-        # Setup child signal handlers differently
-        def _sigterm(*args):
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            raise SignalExit(signal.SIGTERM)
-
-        signal.signal(signal.SIGTERM, _sigterm)
-        # Block SIGINT and let the parent send us a SIGTERM
-        # signal.signal(signal.SIGINT, signal.SIG_IGN)
-        # This differs from the behavior in nova in that we dont ignore this
-        # It allows the non-wsgi services to be terminated properly
-        signal.signal(signal.SIGINT, _sigterm)
-
-        # Reopen the eventlet hub to make sure we don't share an epoll
-        # fd with parent and/or siblings, which would be bad
-        eventlet.hubs.use_hub()
-
-        # Close write to ensure only parent has it open
-        os.close(self.writepipe)
-        # Create greenthread to watch for parent to close pipe
-        eventlet.spawn(self._pipe_watcher)
-
-        # Reseed random number generator
-        random.seed()
-
-        launcher = Launcher()
-        launcher.run_server(server)
-
-    def _start_child(self, wrap):
-        if len(wrap.forktimes) > wrap.workers:
-            # Limit ourselves to one process a second (over the period of
-            # number of workers * 1 second). This will allow workers to
-            # start up quickly but ensure we don't fork off children that
-            # die instantly too quickly.
-            if time.time() - wrap.forktimes[0] < wrap.workers:
-                LOG.info(_('Forking too fast, sleeping'))
-                time.sleep(1)
-
-            wrap.forktimes.pop(0)
-
-        wrap.forktimes.append(time.time())
-
-        pid = os.fork()
-        if pid == 0:
-            # NOTE(johannes): All exceptions are caught to ensure this
-            # doesn't fallback into the loop spawning children. It would
-            # be bad for a child to spawn more children.
-            status = 0
-            try:
-                self._child_process(wrap.server)
-            except SignalExit as exc:
-                signame = {signal.SIGTERM: 'SIGTERM',
-                           signal.SIGINT: 'SIGINT'}[exc.signo]
-                LOG.info(_('Caught %s, exiting'), signame)
-                status = exc.code
-            except SystemExit as exc:
-                status = exc.code
-            except BaseException:
-                LOG.exception(_('Unhandled exception'))
-                status = 2
-            finally:
-                wrap.server.stop()
-
-            os._exit(status)
-
-        LOG.info(_('Started child %d'), pid)
-
-        wrap.children.add(pid)
-        self.children[pid] = wrap
-
-        return pid
-
-    def launch_server(self, server, workers=1):
-        wrap = ServerWrapper(server, workers)
-        self.totalwrap = self.totalwrap + 1
-        LOG.info(_('Starting %d workers'), wrap.workers)
-        while (self.running and len(wrap.children) < wrap.workers
-               and not wrap.failed):
-            self._start_child(wrap)
-
-    def _wait_child(self):
-        try:
-            # Don't block if no child processes have exited
-            pid, status = os.waitpid(0, os.WNOHANG)
-            if not pid:
-                return None
-        except OSError as exc:
-            if exc.errno not in (errno.EINTR, errno.ECHILD):
-                raise
-            return None
-
-        code = 0
-        if os.WIFSIGNALED(status):
-            sig = os.WTERMSIG(status)
-            LOG.info(_('Child %(pid)d killed by signal %(sig)d'),
-                     {'pid': pid, 'sig': sig})
-        else:
-            code = os.WEXITSTATUS(status)
-            LOG.info(_('Child %(pid)d exited with status %(code)d'),
-                     {'pid': pid, 'code': code})
-
-        if pid not in self.children:
-            LOG.warning(_('pid %d not in child list'), pid)
-            return None
-
-        wrap = self.children.pop(pid)
-        wrap.children.remove(pid)
-        if 2 == code:
-            wrap.failed = True
-            self.failedwrap = self.failedwrap + 1
-            LOG.info(_('_wait_child %d'), self.failedwrap)
-            if self.failedwrap == self.totalwrap:
-                self.running = False
-        return wrap
-
-    def wait(self):
-        """Loop waiting on children to die and respawning as necessary."""
-        while self.running:
-            wrap = self._wait_child()
-            if not wrap:
-                # Yield to other threads if no children have exited
-                # Sleep for a short time to avoid excessive CPU usage
-                # (see bug #1095346)
-                eventlet.greenthread.sleep(.01)
-                continue
-
-            LOG.info(_('wait wrap.failed %s'), wrap.failed)
-            while (self.running and len(wrap.children) < wrap.workers
-                   and not wrap.failed):
-                self._start_child(wrap)
-
-        if self.sigcaught:
-            signame = {signal.SIGTERM: 'SIGTERM',
-                       signal.SIGINT: 'SIGINT'}[self.sigcaught]
-            LOG.info(_('Caught %s, stopping children'), signame)
-
-        for pid in self.children:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError as exc:
-                if exc.errno != errno.ESRCH:
-                    raise
-
-        # Wait for children to die
-        if self.children:
-            LOG.info(_('Waiting on %d children to exit'), len(self.children))
-            while self.children:
-                wrap = self._wait_child()
-                if not wrap:
-                    eventlet.greenthread.sleep(.01)
-                    continue
-
-
-class Service(object):
+class Service(service.Service):
     """Service object for binaries running on hosts.
 
     A service takes a manager and enables rpc by listening to queues based
@@ -340,26 +112,36 @@ class Service(object):
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_interval=None, periodic_fuzzy_delay=None,
                  service_name=None, *args, **kwargs):
+        super(Service, self).__init__()
+
+        if not rpc.initialized():
+            rpc.init(CONF)
+
         self.host = host
         self.binary = binary
         self.topic = topic
         self.manager_class_name = manager
         manager_class = importutils.import_class(self.manager_class_name)
+        manager_class = profiler.trace_cls("rpc")(manager_class)
+
         self.manager = manager_class(host=self.host,
                                      service_name=service_name,
                                      *args, **kwargs)
         self.report_interval = report_interval
         self.periodic_interval = periodic_interval
         self.periodic_fuzzy_delay = periodic_fuzzy_delay
-        super(Service, self).__init__(*args, **kwargs)
+        self.basic_config_check()
         self.saved_args, self.saved_kwargs = args, kwargs
         self.timers = []
 
+        setup_profiler(binary, host)
+
     def start(self):
         version_string = version.version_string()
-        LOG.audit(_('Starting %(topic)s node (version %(version_string)s)'),
-                  {'topic': self.topic, 'version_string': version_string})
+        LOG.info(_LI('Starting %(topic)s node (version %(version_string)s)'),
+                 {'topic': self.topic, 'version_string': version_string})
         self.model_disconnected = False
+        self.manager.init_host()
         ctxt = context.get_admin_context()
         try:
             service_ref = db.service_get_by_args(ctxt,
@@ -369,26 +151,20 @@ class Service(object):
         except exception.NotFound:
             self._create_service_ref(ctxt)
 
-        self.conn = rpc.create_connection(new=True)
-        LOG.debug(_("Creating Consumer connection for Service %s") %
-                  self.topic)
+        LOG.debug("Creating RPC server for service %s", self.topic)
 
-        rpc_dispatcher = self.manager.create_rpc_dispatcher()
+        target = messaging.Target(topic=self.topic, server=self.host)
+        endpoints = [self.manager]
+        endpoints.extend(self.manager.additional_endpoints)
+        serializer = objects_base.CinderObjectSerializer()
+        self.rpcserver = rpc.get_server(target, endpoints, serializer)
+        self.rpcserver.start()
 
-        # Share this same connection for these Consumers
-        self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=False)
-
-        node_topic = '%s:%s' % (self.topic, self.host)
-        self.conn.create_consumer(node_topic, rpc_dispatcher, fanout=False)
-
-        self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=True)
-
-        # Consume from all consumers in a thread
-        self.conn.consume_in_thread()
-        self.manager.init_host()
+        self.manager.init_host_with_rpc()
 
         if self.report_interval:
-            pulse = utils.LoopingCall(self.report_state)
+            pulse = loopingcall.FixedIntervalLoopingCall(
+                self.report_state)
             pulse.start(interval=self.report_interval,
                         initial_delay=self.report_interval)
             self.timers.append(pulse)
@@ -399,10 +175,28 @@ class Service(object):
             else:
                 initial_delay = None
 
-            periodic = utils.LoopingCall(self.periodic_tasks)
+            periodic = loopingcall.FixedIntervalLoopingCall(
+                self.periodic_tasks)
             periodic.start(interval=self.periodic_interval,
                            initial_delay=initial_delay)
             self.timers.append(periodic)
+
+    def basic_config_check(self):
+        """Perform basic config checks before starting service."""
+        # Make sure report interval is less than service down time
+        if self.report_interval:
+            if CONF.service_down_time <= self.report_interval:
+                new_down_time = int(self.report_interval * 2.5)
+                LOG.warning(
+                    _LW("Report interval must be less than service down "
+                        "time. Current config service_down_time: "
+                        "%(service_down_time)s, report_interval for this: "
+                        "service is: %(report_interval)s. Setting global "
+                        "service_down_time to: %(new_down_time)s"),
+                    {'service_down_time': CONF.service_down_time,
+                     'report_interval': self.report_interval,
+                     'new_down_time': new_down_time})
+                CONF.set_override('service_down_time', new_down_time)
 
     def _create_service_ref(self, context):
         zone = CONF.storage_availability_zone
@@ -462,13 +256,13 @@ class Service(object):
         try:
             db.service_destroy(context.get_admin_context(), self.service_id)
         except exception.NotFound:
-            LOG.warn(_('Service killed that has no database entry'))
+            LOG.warning(_LW('Service killed that has no database entry'))
 
     def stop(self):
         # Try to shut the connection down, but if we get any sort of
         # errors, go ahead and ignore them.. as we're shutting down anyway
         try:
-            self.conn.close()
+            self.rpcserver.stop()
         except Exception:
             pass
         for x in self.timers:
@@ -477,6 +271,7 @@ class Service(object):
             except Exception:
                 pass
         self.timers = []
+        super(Service, self).stop()
 
     def wait(self):
         for x in self.timers:
@@ -499,8 +294,8 @@ class Service(object):
             try:
                 service_ref = db.service_get(ctxt, self.service_id)
             except exception.NotFound:
-                LOG.debug(_('The service database object disappeared, '
-                            'Recreating it.'))
+                LOG.debug('The service database object disappeared, '
+                          'recreating it.')
                 self._create_service_ref(ctxt)
                 service_ref = db.service_get(ctxt, self.service_id)
 
@@ -514,13 +309,12 @@ class Service(object):
             # TODO(termie): make this pattern be more elegant.
             if getattr(self, 'model_disconnected', False):
                 self.model_disconnected = False
-                LOG.error(_('Recovered model server connection!'))
+                LOG.error(_LE('Recovered model server connection!'))
 
-        # TODO(vish): this should probably only catch connection errors
-        except Exception:  # pylint: disable=W0702
+        except db_exc.DBConnectionError:
             if not getattr(self, 'model_disconnected', False):
                 self.model_disconnected = True
-                LOG.exception(_('model server went away'))
+                LOG.exception(_LE('model server went away'))
 
 
 class WSGIService(object):
@@ -540,6 +334,17 @@ class WSGIService(object):
         self.app = self.loader.load_app(name)
         self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
         self.port = getattr(CONF, '%s_listen_port' % name, 0)
+        self.workers = (getattr(CONF, '%s_workers' % name, None) or
+                        processutils.get_worker_count())
+        if self.workers and self.workers < 1:
+            worker_name = '%s_workers' % name
+            msg = (_("%(worker_name)s value of %(workers)d is invalid, "
+                     "must be greater than 0.") %
+                   {'worker_name': worker_name,
+                    'workers': self.workers})
+            raise exception.InvalidInput(msg)
+        setup_profiler(name, self.host)
+
         self.server = wsgi.Server(name,
                                   self.app,
                                   host=self.host,
@@ -596,6 +401,18 @@ class WSGIService(object):
         """
         self.server.wait()
 
+    def reset(self):
+        """Reset server greenpool size to default.
+
+        :returns: None
+
+        """
+        self.server.reset()
+
+
+def process_launcher():
+    return service.ProcessLauncher()
+
 
 # NOTE(vish): the global launcher is to maintain the existing
 #             functionality of calling service.serve +
@@ -603,28 +420,46 @@ class WSGIService(object):
 _launcher = None
 
 
-def serve(*servers):
+def serve(server, workers=None):
     global _launcher
-    if not _launcher:
-        _launcher = Launcher()
-    for server in servers:
-        _launcher.launch_server(server)
+    if _launcher:
+        raise RuntimeError(_('serve() can only be called once'))
+
+    _launcher = service.launch(server, workers=workers)
 
 
 def wait():
-    LOG.debug(_('Full set of CONF:'))
+    LOG.debug('Full set of CONF:')
     for flag in CONF:
         flag_get = CONF.get(flag, None)
         # hide flag contents from log if contains a password
         # should use secret flag when switch over to openstack-common
         if ("_password" in flag or "_key" in flag or
-                (flag == "sql_connection" and "mysql:" in flag_get)):
-            LOG.debug(_('%s : FLAG SET ') % flag)
+                (flag == "sql_connection" and
+                    ("mysql:" in flag_get or "postgresql:" in flag_get))):
+            LOG.debug('%s : FLAG SET ', flag)
         else:
-            LOG.debug('%(flag)s : %(flag_get)s' %
+            LOG.debug('%(flag)s : %(flag_get)s',
                       {'flag': flag, 'flag_get': flag_get})
     try:
         _launcher.wait()
     except KeyboardInterrupt:
         _launcher.stop()
     rpc.cleanup()
+
+
+class Launcher(object):
+    def __init__(self):
+        self.launch_service = serve
+        self.wait = wait
+
+
+def get_launcher():
+    # Note(lpetrut): ProcessLauncher uses green pipes which fail on Windows
+    # due to missing support of non-blocking I/O pipes. For this reason, the
+    # service must be spawned differently on Windows, using the ServiceLauncher
+    # class instead.
+    if os.name == 'nt':
+        return Launcher()
+    else:
+        return process_launcher()

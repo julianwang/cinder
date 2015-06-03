@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,10 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 from sqlalchemy import Boolean, Column, DateTime, Integer
 from sqlalchemy import MetaData, String, Table
 
-from cinder.openstack.common import log as logging
+from cinder.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -30,7 +29,7 @@ def upgrade(migrate_engine):
     try:
         table.drop()
     except Exception:
-        LOG.error(_("migrations table not dropped"))
+        LOG.error(_LE("migrations table not dropped"))
         raise
 
 
@@ -60,5 +59,5 @@ def downgrade(migrate_engine):
     try:
         table.create()
     except Exception:
-        LOG.error(_("Table |%s| not created"), repr(table))
+        LOG.error(_LE("Table |%s| not created"), repr(table))
         raise

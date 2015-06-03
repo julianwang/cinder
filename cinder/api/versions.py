@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -19,7 +17,7 @@
 import datetime
 
 from lxml import etree
-from oslo.config import cfg
+from oslo_config import cfg
 
 from cinder.api.openstack import wsgi
 from cinder.api.views import versions as views_versions
@@ -37,16 +35,8 @@ _KNOWN_VERSIONS = {
         "links": [
             {
                 "rel": "describedby",
-                "type": "application/pdf",
-                "href": "http://jorgew.github.com/block-storage-api/"
-                        "content/os-block-storage-1.0.pdf",
-            },
-            {
-                "rel": "describedby",
-                "type": "application/vnd.sun.wadl+xml",
-                #(anthony) FIXME
-                "href": "http://docs.rackspacecloud.com/"
-                        "servers/api/v1.1/application.wadl",
+                "type": "text/html",
+                "href": "http://docs.openstack.org/",
             },
         ],
         "media-types": [
@@ -62,21 +52,13 @@ _KNOWN_VERSIONS = {
     },
     "v1.0": {
         "id": "v1.0",
-        "status": "CURRENT",
-        "updated": "2012-01-04T11:33:21Z",
+        "status": "SUPPORTED",
+        "updated": "2014-06-28T12:20:21Z",
         "links": [
             {
                 "rel": "describedby",
-                "type": "application/pdf",
-                "href": "http://jorgew.github.com/block-storage-api/"
-                        "content/os-block-storage-1.0.pdf",
-            },
-            {
-                "rel": "describedby",
-                "type": "application/vnd.sun.wadl+xml",
-                #(anthony) FIXME
-                "href": "http://docs.rackspacecloud.com/"
-                        "servers/api/v1.1/application.wadl",
+                "type": "text/html",
+                "href": "http://docs.openstack.org/",
             },
         ],
         "media-types": [
@@ -157,7 +139,7 @@ class AtomSerializer(wsgi.XMLDictSerializer):
     def __init__(self, metadata=None, xmlns=None):
         self.metadata = metadata or {}
         if not xmlns:
-            self.xmlns = wsgi.XMLNS_ATOM
+            self.xmlns = wsgi.XML_NS_ATOM
         else:
             self.xmlns = xmlns
 
@@ -272,13 +254,16 @@ class Versions(wsgi.Resource):
         return args
 
 
-class VolumeVersionV1(object):
+class VolumeVersion(object):
     @wsgi.serializers(xml=VersionTemplate,
                       atom=VersionAtomSerializer)
     def show(self, req):
         builder = views_versions.get_view_builder(req)
-        return builder.build_version(_KNOWN_VERSIONS['v1.0'])
+        if 'v1' in builder.base_url:
+            return builder.build_version(_KNOWN_VERSIONS['v1.0'])
+        else:
+            return builder.build_version(_KNOWN_VERSIONS['v2.0'])
 
 
 def create_resource():
-    return wsgi.Resource(VolumeVersionV1())
+    return wsgi.Resource(VolumeVersion())

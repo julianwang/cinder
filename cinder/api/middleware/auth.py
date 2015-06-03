@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -22,14 +20,16 @@ Common Auth Middleware.
 
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_middleware import request_id
+from oslo_serialization import jsonutils
 import webob.dec
 import webob.exc
 
 from cinder.api.openstack import wsgi
 from cinder import context
-from cinder.openstack.common import jsonutils
-from cinder.openstack.common import log as logging
+from cinder.i18n import _
 from cinder import wsgi as base_wsgi
 
 
@@ -74,7 +74,7 @@ class InjectContext(base_wsgi.Middleware):
 
 
 class CinderKeystoneContext(base_wsgi.Middleware):
-    """Make a request context from keystone headers"""
+    """Make a request context from keystone headers."""
 
     @webob.dec.wsgify(RequestClass=base_wsgi.Request)
     def __call__(self, req):
@@ -93,6 +93,9 @@ class CinderKeystoneContext(base_wsgi.Middleware):
             project_id = req.headers['X_TENANT']
 
         project_name = req.headers.get('X_TENANT_NAME')
+
+        req_id = req.environ.get(request_id.ENV_REQUEST_ID)
+
         # Get the auth token
         auth_token = req.headers.get('X_AUTH_TOKEN',
                                      req.headers.get('X_STORAGE_TOKEN'))
@@ -107,7 +110,7 @@ class CinderKeystoneContext(base_wsgi.Middleware):
                 service_catalog = jsonutils.loads(catalog_header)
             except ValueError:
                 raise webob.exc.HTTPInternalServerError(
-                    _('Invalid service catalog json.'))
+                    explanation=_('Invalid service catalog json.'))
 
         if CONF.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For', remote_address)
@@ -117,7 +120,8 @@ class CinderKeystoneContext(base_wsgi.Middleware):
                                      roles=roles,
                                      auth_token=auth_token,
                                      remote_address=remote_address,
-                                     service_catalog=service_catalog)
+                                     service_catalog=service_catalog,
+                                     request_id=req_id)
 
         req.environ['cinder.context'] = ctx
         return self.application

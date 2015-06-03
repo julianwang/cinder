@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2013 IBM Corp.
 # All Rights Reserved.
@@ -19,33 +17,28 @@
 import inspect
 import math
 import time
-import webob
-
-from cinder import exception
-from cinder.openstack.common import gettextutils
-from cinder.openstack.common import jsonutils
-from cinder.openstack.common import log as logging
-from cinder import utils
-from cinder import wsgi
-
-from lxml import etree
-import six
 from xml.dom import minidom
 from xml.parsers import expat
 
+from lxml import etree
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import excutils
+import six
+import webob
 
-XMLNS_V1 = 'http://docs.openstack.org/volume/api/v1'
-XMLNS_ATOM = 'http://www.w3.org/2005/Atom'
+from cinder import exception
+from cinder import i18n
+from cinder.i18n import _, _LE, _LI
+from cinder import utils
+from cinder import wsgi
+
+
+XML_NS_V1 = 'http://docs.openstack.org/api/openstack-block-storage/1.0/content'
+XML_NS_V2 = 'http://docs.openstack.org/api/openstack-block-storage/2.0/content'
+XML_NS_ATOM = 'http://www.w3.org/2005/Atom'
 
 LOG = logging.getLogger(__name__)
-
-# The vendor content types should serialize identically to the non-vendor
-# content types. So to avoid littering the code with both options, we
-# map the vendor to the other when looking up the type
-_CONTENT_TYPE_MAP = {
-    'application/vnd.openstack.volume+json': 'application/json',
-    'application/vnd.openstack.volume+xml': 'application/xml',
-}
 
 SUPPORTED_CONTENT_TYPES = (
     'application/json',
@@ -140,6 +133,86 @@ class Request(webob.Request):
             return None
         return resources.get(resource_id)
 
+    def cache_db_items(self, key, items, item_key='id'):
+        """Allow API methods to store objects from a DB query to be
+        used by API extensions within the same API request.
+
+        An instance of this class only lives for the lifetime of a
+        single API request, so there's no need to implement full
+        cache management.
+        """
+        self.cache_resource(items, item_key, key)
+
+    def get_db_items(self, key):
+        """Allow an API extension to get previously stored objects within
+        the same API request.
+
+        Note that the object data will be slightly stale.
+        """
+        return self.cached_resource(key)
+
+    def get_db_item(self, key, item_key):
+        """Allow an API extension to get a previously stored object
+        within the same API request.
+
+        Note that the object data will be slightly stale.
+        """
+        return self.get_db_items(key).get(item_key)
+
+    def cache_db_volumes(self, volumes):
+        # NOTE(mgagne) Cache it twice for backward compatibility reasons
+        self.cache_db_items('volumes', volumes, 'id')
+        self.cache_db_items(self.path, volumes, 'id')
+
+    def cache_db_volume(self, volume):
+        # NOTE(mgagne) Cache it twice for backward compatibility reasons
+        self.cache_db_items('volumes', [volume], 'id')
+        self.cache_db_items(self.path, [volume], 'id')
+
+    def get_db_volumes(self):
+        return (self.get_db_items('volumes') or
+                self.get_db_items(self.path))
+
+    def get_db_volume(self, volume_id):
+        return (self.get_db_item('volumes', volume_id) or
+                self.get_db_item(self.path, volume_id))
+
+    def cache_db_volume_types(self, volume_types):
+        self.cache_db_items('volume_types', volume_types, 'id')
+
+    def cache_db_volume_type(self, volume_type):
+        self.cache_db_items('volume_types', [volume_type], 'id')
+
+    def get_db_volume_types(self):
+        return self.get_db_items('volume_types')
+
+    def get_db_volume_type(self, volume_type_id):
+        return self.get_db_item('volume_types', volume_type_id)
+
+    def cache_db_snapshots(self, snapshots):
+        self.cache_db_items('snapshots', snapshots, 'id')
+
+    def cache_db_snapshot(self, snapshot):
+        self.cache_db_items('snapshots', [snapshot], 'id')
+
+    def get_db_snapshots(self):
+        return self.get_db_items('snapshots')
+
+    def get_db_snapshot(self, snapshot_id):
+        return self.get_db_item('snapshots', snapshot_id)
+
+    def cache_db_backups(self, backups):
+        self.cache_db_items('backups', backups, 'id')
+
+    def cache_db_backup(self, backup):
+        self.cache_db_items('backups', [backup], 'id')
+
+    def get_db_backups(self):
+        return self.get_db_items('backups')
+
+    def get_db_backup(self, backup_id):
+        return self.get_db_item('backups', backup_id)
+
     def best_match_content_type(self):
         """Determine the requested response content-type."""
         if 'cinder.best_content_type' not in self.environ:
@@ -186,7 +259,7 @@ class Request(webob.Request):
         """
         if not self.accept_language:
             return None
-        all_languages = gettextutils.get_available_languages('cinder')
+        all_languages = i18n.get_available_languages()
         return self.accept_language.best_match(all_languages)
 
 
@@ -204,7 +277,7 @@ class ActionDispatcher(object):
 
 
 class TextDeserializer(ActionDispatcher):
-    """Default request body deserialization"""
+    """Default request body deserialization."""
 
     def deserialize(self, datastring, action='default'):
         return self.dispatch(datastring, action=action)
@@ -278,28 +351,30 @@ class XMLDeserializer(TextDeserializer):
         return None
 
     def find_first_child_named(self, parent, name):
-        """Search a nodes children for the first child with a given name"""
+        """Search a nodes children for the first child with a given name."""
         for node in parent.childNodes:
             if node.nodeName == name:
                 return node
         return None
 
     def find_children_named(self, parent, name):
-        """Return all of a nodes children who have the given name"""
+        """Return all of a nodes children who have the given name."""
         for node in parent.childNodes:
             if node.nodeName == name:
                 yield node
 
     def extract_text(self, node):
-        """Get the text field contained by the given node"""
-        if len(node.childNodes) == 1:
-            child = node.childNodes[0]
+        """Get the text field contained by the given node."""
+        text = []
+        # Cannot assume entire text will be in a single child node because SAX
+        # parsers may split contiguous character data into multiple chunks
+        for child in node.childNodes:
             if child.nodeType == child.TEXT_NODE:
-                return child.nodeValue
-        return ""
+                text.append(child.nodeValue)
+        return ''.join(text)
 
     def find_attribute_or_element(self, parent, name):
-        """Get an attribute value; fallback to an element if not found"""
+        """Get an attribute value; fallback to an element if not found."""
         if parent.hasAttribute(name):
             return parent.getAttribute(name)
 
@@ -316,7 +391,7 @@ class XMLDeserializer(TextDeserializer):
 class MetadataXMLDeserializer(XMLDeserializer):
 
     def extract_metadata(self, metadata_node):
-        """Marshal the metadata attribute of a parsed request"""
+        """Marshal the metadata attribute of a parsed request."""
         metadata = {}
         if metadata_node is not None:
             for meta_node in self.find_children_named(metadata_node, "meta"):
@@ -326,7 +401,7 @@ class MetadataXMLDeserializer(XMLDeserializer):
 
 
 class DictSerializer(ActionDispatcher):
-    """Default request body serialization"""
+    """Default request body serialization."""
 
     def serialize(self, data, action='default'):
         return self.dispatch(data, action=action)
@@ -336,7 +411,7 @@ class DictSerializer(ActionDispatcher):
 
 
 class JSONDictSerializer(DictSerializer):
-    """Default JSON request body serialization"""
+    """Default JSON request body serialization."""
 
     def default(self, data):
         return jsonutils.dumps(data)
@@ -367,7 +442,7 @@ class XMLDictSerializer(DictSerializer):
         self._add_xmlns(node, has_atom)
         return node.toxml('UTF-8')
 
-    #NOTE (ameade): the has_atom should be removed after all of the
+    # NOTE (ameade): the has_atom should be removed after all of the
     # xml serializers and view builders have been updated to the current
     # spec that required all responses include the xmlns:atom, the has_atom
     # flag is to prevent current tests from breaking
@@ -387,7 +462,7 @@ class XMLDictSerializer(DictSerializer):
         if xmlns:
             result.setAttribute('xmlns', xmlns)
 
-        #TODO(bcwaldon): accomplish this without a type-check
+        # TODO(bcwaldon): accomplish this without a type-check
         if isinstance(data, list):
             collections = metadata.get('list_collections', {})
             if nodename in collections:
@@ -406,7 +481,7 @@ class XMLDictSerializer(DictSerializer):
             for item in data:
                 node = self._to_xml_node(doc, metadata, singular, item)
                 result.appendChild(node)
-        #TODO(bcwaldon): accomplish this without a type-check
+        # TODO(bcwaldon): accomplish this without a type-check
         elif isinstance(data, dict):
             collections = metadata.get('dict_collections', {})
             if nodename in collections:
@@ -676,15 +751,15 @@ class ResourceExceptionHandler(object):
                 code=ex_value.code, explanation=ex_value.msg))
         elif isinstance(ex_value, TypeError):
             exc_info = (ex_type, ex_value, ex_traceback)
-            LOG.error(_(
-                'Exception handling resource: %s') %
+            LOG.error(_LE(
+                'Exception handling resource: %s'),
                 ex_value, exc_info=exc_info)
             raise Fault(webob.exc.HTTPBadRequest())
         elif isinstance(ex_value, Fault):
-            LOG.info(_("Fault thrown: %s"), unicode(ex_value))
+            LOG.info(_LI("Fault thrown: %s"), ex_value)
             raise ex_value
         elif isinstance(ex_value, webob.exc.HTTPException):
-            LOG.info(_("HTTP exception thrown: %s"), unicode(ex_value))
+            LOG.info(_LI("HTTP exception thrown: %s"), ex_value)
             raise Fault(ex_value)
 
         # We didn't handle the exception
@@ -792,17 +867,17 @@ class Resource(wsgi.Application):
     def get_body(self, request):
 
         if len(request.body) == 0:
-            LOG.debug(_("Empty body provided in request"))
+            LOG.debug("Empty body provided in request")
             return None, ''
 
         try:
             content_type = request.get_content_type()
         except exception.InvalidContentType:
-            LOG.debug(_("Unrecognized Content-Type provided in request"))
+            LOG.debug("Unrecognized Content-Type provided in request")
             return None, ''
 
         if not content_type:
-            LOG.debug(_("No Content-Type provided in request"))
+            LOG.debug("No Content-Type provided in request")
             return None, ''
 
         return content_type, request.body
@@ -884,8 +959,9 @@ class Resource(wsgi.Application):
     def __call__(self, request):
         """WSGI method that controls (de)serialization and method dispatch."""
 
-        LOG.info("%(method)s %(url)s" % {"method": request.method,
-                                         "url": request.url})
+        LOG.info(_LI("%(method)s %(url)s"),
+                 {"method": request.method,
+                  "url": request.url})
 
         # Identify the action, its arguments, and the requested
         # content type
@@ -983,12 +1059,12 @@ class Resource(wsgi.Application):
 
         try:
             msg_dict = dict(url=request.url, status=response.status_int)
-            msg = _("%(url)s returned with HTTP %(status)d") % msg_dict
+            msg = _LI("%(url)s returned with HTTP %(status)d")
         except AttributeError as e:
             msg_dict = dict(url=request.url, e=e)
-            msg = _("%(url)s returned a fault: %(e)s") % msg_dict
+            msg = _LI("%(url)s returned a fault: %(e)s")
 
-        LOG.info(msg)
+        LOG.info(msg, msg_dict)
 
         return response
 
@@ -1001,11 +1077,15 @@ class Resource(wsgi.Application):
                 meth = getattr(self, action)
             else:
                 meth = getattr(self.controller, action)
-        except AttributeError:
-            if (not self.wsgi_actions or
-                    action not in ['action', 'create', 'delete']):
-                # Propagate the error
-                raise
+        except AttributeError as e:
+            with excutils.save_and_reraise_exception(e) as ctxt:
+                if (not self.wsgi_actions or action not in ['action',
+                                                            'create',
+                                                            'delete',
+                                                            'update']):
+                    LOG.exception(_LE('Get method error.'))
+                else:
+                    ctxt.reraise = False
         else:
             return meth, self.wsgi_extensions.get(action, [])
 
@@ -1013,7 +1093,7 @@ class Resource(wsgi.Application):
             # OK, it's an action; figure out which action...
             mtype = _MEDIA_TYPE_MAP.get(content_type)
             action_name = self.action_peek[mtype](body)
-            LOG.debug("Action body: %s" % body)
+            LOG.debug("Action body: %s", body)
         else:
             action_name = action
 
@@ -1166,16 +1246,16 @@ class Fault(webob.exc.HTTPException):
         fault_data = {
             fault_name: {
                 'code': code,
-                'message': gettextutils.get_localized_message(explanation,
-                                                              locale)}}
+                'message': i18n.translate(explanation, locale)}}
         if code == 413:
-            retry = self.wrapped_exc.headers['Retry-After']
-            fault_data[fault_name]['retryAfter'] = retry
+            retry = self.wrapped_exc.headers.get('Retry-After', None)
+            if retry:
+                fault_data[fault_name]['retryAfter'] = retry
 
         # 'code' is an attribute on the fault tag itself
         metadata = {'attributes': {fault_name: 'code'}}
 
-        xml_serializer = XMLDictSerializer(metadata, XMLNS_V1)
+        xml_serializer = XMLDictSerializer(metadata, XML_NS_V2)
 
         content_type = req.best_match_content_type()
         serializer = {
@@ -1229,14 +1309,14 @@ class OverLimitFault(webob.exc.HTTPException):
 
         def translate(msg):
             locale = request.best_match_language()
-            return gettextutils.get_localized_message(msg, locale)
+            return i18n.translate(msg, locale)
 
         self.content['overLimitFault']['message'] = \
             translate(self.content['overLimitFault']['message'])
         self.content['overLimitFault']['details'] = \
             translate(self.content['overLimitFault']['details'])
 
-        xml_serializer = XMLDictSerializer(metadata, XMLNS_V1)
+        xml_serializer = XMLDictSerializer(metadata, XML_NS_V2)
         serializer = {
             'application/xml': xml_serializer,
             'application/json': JSONDictSerializer(),

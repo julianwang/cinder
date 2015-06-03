@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,20 +15,11 @@
 
 import os
 
-from oslo.config import cfg
-
-from cinder.openstack.common import gettextutils
-gettextutils.install('cinder', lazy=False)
-
 from cinder.db.sqlalchemy import migrate_repo
-import cinder.openstack.common.db.sqlalchemy.session
-from cinder import version
 
 from migrate.versioning.shell import main
 
-CONF = cfg.CONF
 
 if __name__ == '__main__':
-    CONF([], project='cinder', version=version.version_string())
-    main(debug='False', url=CONF.database.connection,
+    main(debug='False',
          repository=os.path.abspath(os.path.dirname(migrate_repo.__file__)))

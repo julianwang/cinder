@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Zadara Storage Inc.
 # Copyright (c) 2011 OpenStack Foundation
 #
@@ -59,6 +57,7 @@ class VolumeTypesController(wsgi.Controller):
         """Returns the list of volume types."""
         context = req.environ['cinder.context']
         vol_types = volume_types.get_all_types(context).values()
+        req.cache_resource(vol_types, name='types')
         return self._view_builder.index(req, vol_types)
 
     @wsgi.serializers(xml=VolumeTypeTemplate)
@@ -68,11 +67,10 @@ class VolumeTypesController(wsgi.Controller):
 
         try:
             vol_type = volume_types.get_volume_type(context, id)
+            req.cache_resource(vol_type, name='types')
         except exception.NotFound:
             raise exc.HTTPNotFound()
 
-        # TODO(bcwaldon): remove str cast once we use uuids
-        vol_type['id'] = str(vol_type['id'])
         return self._view_builder.show(req, vol_type)
 
 

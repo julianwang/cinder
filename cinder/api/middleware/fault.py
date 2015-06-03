@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -16,12 +14,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
+import six
 import webob.dec
 import webob.exc
 
 from cinder.api.openstack import wsgi
 from cinder import exception
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LE, _LI
 from cinder import utils
 from cinder import wsgi as base_wsgi
 
@@ -43,8 +43,8 @@ class FaultWrapper(base_wsgi.Middleware):
             status, webob.exc.HTTPInternalServerError)()
 
     def _error(self, inner, req):
-        LOG.exception(_("Caught error: %s"), unicode(inner))
-
+        if not isinstance(inner, exception.QuotaError):
+            LOG.error(_LE("Caught error: %s"), inner)
         safe = getattr(inner, 'safe', False)
         headers = getattr(inner, 'headers', None)
         status = getattr(inner, 'code', 500)
@@ -52,7 +52,7 @@ class FaultWrapper(base_wsgi.Middleware):
             status = 500
 
         msg_dict = dict(url=req.url, status=status)
-        LOG.info(_("%(url)s returned with HTTP %(status)d") % msg_dict)
+        LOG.info(_LI("%(url)s returned with HTTP %(status)d"), msg_dict)
         outer = self.status_to_type(status)
         if headers:
             outer.headers = headers
@@ -65,7 +65,7 @@ class FaultWrapper(base_wsgi.Middleware):
         # including those that are safe to expose, see bug 1021373
         if safe:
             msg = (inner.msg if isinstance(inner, exception.CinderException)
-                   else unicode(inner))
+                   else six.text_type(inner))
             params = {'exception': inner.__class__.__name__,
                       'explanation': msg}
             outer.explanation = _('%(exception)s: %(explanation)s') % params

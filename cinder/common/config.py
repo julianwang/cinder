@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -27,54 +25,25 @@ stepping stone.
 
 """
 
-import os
 import socket
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import netutils
 
-from cinder.openstack.common.gettextutils import _
+from cinder.i18n import _
 
 
 CONF = cfg.CONF
-
-
-def _get_my_ip():
-    """
-    Returns the actual ip of the local machine.
-
-    This code figures out what source address would be used if some traffic
-    were to be sent out to some well known address on the Internet. In this
-    case, a Google DNS server is used, but the specific address does not
-    matter much.  No traffic is actually sent.
-    """
-    try:
-        csock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        csock.connect(('8.8.8.8', 80))
-        (addr, port) = csock.getsockname()
-        csock.close()
-        return addr
-    except socket.error:
-        return "127.0.0.1"
-
+logging.register_options(CONF)
 
 core_opts = [
-    cfg.StrOpt('connection_type',
-               default=None,
-               help='Virtualization api connection type : libvirt, xenapi, '
-                    'or fake'),
     cfg.StrOpt('api_paste_config',
                default="api-paste.ini",
                help='File name for the paste.deploy config for cinder-api'),
-    cfg.StrOpt('pybasedir',
-               default=os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                                    '..',
-                                                    '..')),
-               help='Directory where the cinder python module is installed'),
-    cfg.StrOpt('bindir',
-               default='$pybasedir/bin',
-               help='Directory where cinder binaries are installed'),
     cfg.StrOpt('state_path',
-               default='$pybasedir',
+               default='/var/lib/cinder',
+               deprecated_name='pybasedir',
                help="Top-level directory for maintaining cinder's state"), ]
 
 debug_opts = [
@@ -85,21 +54,21 @@ CONF.register_cli_opts(debug_opts)
 
 global_opts = [
     cfg.StrOpt('my_ip',
-               default=_get_my_ip(),
-               help='ip address of this host'),
+               default=netutils.get_my_ipv4(),
+               help='IP address of this host'),
     cfg.StrOpt('glance_host',
                default='$my_ip',
-               help='default glance hostname or ip'),
+               help='Default glance host name or IP'),
     cfg.IntOpt('glance_port',
                default=9292,
-               help='default glance port'),
+               help='Default glance port'),
     cfg.ListOpt('glance_api_servers',
                 default=['$glance_host:$glance_port'],
-                help='A list of the glance api servers available to cinder '
+                help='A list of the glance API servers available to cinder '
                      '([hostname|ip]:port)'),
     cfg.IntOpt('glance_api_version',
                default=1,
-               help='Version of the glance api to use'),
+               help='Version of the glance API to use'),
     cfg.IntOpt('glance_num_retries',
                default=0,
                help='Number retries when downloading an image from glance'),
@@ -109,12 +78,14 @@ global_opts = [
                      'glance'),
     cfg.BoolOpt('glance_api_ssl_compression',
                 default=False,
-                help='Whether to attempt to negotiate SSL layer compression '
-                     'when using SSL (https) requests. Set to False to '
-                     'disable SSL layer compression. In some cases disabling '
-                     'this may improve data throughput, eg when high network '
-                     'bandwidth is available and you are using already '
-                     'compressed image formats such as qcow2 .'),
+                help='Enables or disables negotiation of SSL layer '
+                     'compression. In some cases disabling compression '
+                     'can improve data throughput, such as when high '
+                     'network bandwidth is available and you use '
+                     'compressed image formats like qcow2.'),
+    cfg.StrOpt('glance_ca_certificates_file',
+               help='Location of ca certificates file to use for glance '
+                    'client requests.'),
     cfg.IntOpt('glance_request_timeout',
                default=None,
                help='http/https timeout value for glance operations. If no '
@@ -122,22 +93,22 @@ global_opts = [
                     'value is used.'),
     cfg.StrOpt('scheduler_topic',
                default='cinder-scheduler',
-               help='the topic scheduler nodes listen on'),
+               help='The topic that scheduler nodes listen on'),
     cfg.StrOpt('volume_topic',
                default='cinder-volume',
-               help='the topic volume nodes listen on'),
+               help='The topic that volume nodes listen on'),
     cfg.StrOpt('backup_topic',
                default='cinder-backup',
-               help='the topic volume backup nodes listen on'),
+               help='The topic that volume backup nodes listen on'),
     cfg.BoolOpt('enable_v1_api',
                 default=True,
-                help=_("Deploy v1 of the Cinder API.")),
+                help=_("DEPRECATED: Deploy v1 of the Cinder API.")),
     cfg.BoolOpt('enable_v2_api',
                 default=True,
                 help=_("Deploy v2 of the Cinder API.")),
     cfg.BoolOpt('api_rate_limit',
                 default=True,
-                help='whether to rate limit the api'),
+                help='Enables or disables rate limit of the API.'),
     cfg.ListOpt('osapi_volume_ext_list',
                 default=[],
                 help='Specify list of extensions to load when using osapi_'
@@ -148,40 +119,33 @@ global_opts = [
                     help='osapi volume extension to load'),
     cfg.StrOpt('volume_manager',
                default='cinder.volume.manager.VolumeManager',
-               help='full class name for the Manager for volume'),
+               help='Full class name for the Manager for volume'),
     cfg.StrOpt('backup_manager',
                default='cinder.backup.manager.BackupManager',
-               help='full class name for the Manager for volume backup'),
+               help='Full class name for the Manager for volume backup'),
     cfg.StrOpt('scheduler_manager',
                default='cinder.scheduler.manager.SchedulerManager',
-               help='full class name for the Manager for scheduler'),
+               help='Full class name for the Manager for scheduler'),
     cfg.StrOpt('host',
                default=socket.gethostname(),
-               help='Name of this node.  This can be an opaque identifier.  '
-                    'It is not necessarily a hostname, FQDN, or IP address.'),
+               help='Name of this node.  This can be an opaque identifier. '
+                    'It is not necessarily a host name, FQDN, or IP address.'),
     # NOTE(vish): default to nova for compatibility with nova installs
     cfg.StrOpt('storage_availability_zone',
                default='nova',
-               help='availability zone of this node'),
+               help='Availability zone of this node'),
     cfg.StrOpt('default_availability_zone',
                default=None,
-               help='default availability zone to use when creating a new volume. '
-                    'If this is not set then we use the value from the '
-                    'storage_availability_zone option as the default '
-                    'availability_zone for new volumes.'),
-    cfg.ListOpt('memcached_servers',
-                default=None,
-                help='Memcached servers or None for in process cache.'),
+               help='Default availability zone for new volumes. If not set, '
+                    'the storage_availability_zone option value is used as '
+                    'the default for new volumes.'),
     cfg.StrOpt('default_volume_type',
                default=None,
-               help='default volume type to use'),
+               help='Default volume type to use'),
     cfg.StrOpt('volume_usage_audit_period',
                default='month',
-               help='time period to generate volume usages for.  '
-                    'Time period must be hour, day, month or year'),
-    cfg.StrOpt('root_helper',
-               default='sudo',
-               help='Deprecated: command to use for running commands as root'),
+               help='Time period for which to generate volume usages. '
+                    'The options are hour, day, month, or year.'),
     cfg.StrOpt('rootwrap_config',
                default='/etc/cinder/rootwrap.conf',
                help='Path to the rootwrap configuration file to use for '
@@ -194,7 +158,8 @@ global_opts = [
                 help='List of modules/decorators to monkey patch'),
     cfg.IntOpt('service_down_time',
                default=60,
-               help='maximum time since last check-in for up service'),
+               help='Maximum time since last check-in for a service to be '
+                    'considered up'),
     cfg.StrOpt('volume_api_class',
                default='cinder.volume.api.API',
                help='The full class name of the volume API class to use'),
@@ -202,7 +167,8 @@ global_opts = [
                default='cinder.backup.api.API',
                help='The full class name of the volume backup API class'),
     cfg.StrOpt('auth_strategy',
-               default='noauth',
+               default='keystone',
+               choices=['noauth', 'keystone', 'deprecated'],
                help='The strategy to use for auth. Supports noauth, keystone, '
                     'and deprecated.'),
     cfg.ListOpt('enabled_backends',
@@ -212,9 +178,30 @@ global_opts = [
                      'with its options'),
     cfg.BoolOpt('no_snapshot_gb_quota',
                 default=False,
-                help='Whether snapshots count against GigaByte quota'),
+                help='Whether snapshots count against gigabyte quota'),
     cfg.StrOpt('transfer_api_class',
                default='cinder.transfer.api.API',
-               help='The full class name of the volume transfer API class'), ]
+               help='The full class name of the volume transfer API class'),
+    cfg.StrOpt('replication_api_class',
+               default='cinder.replication.api.API',
+               help='The full class name of the volume replication API class'),
+    cfg.StrOpt('consistencygroup_api_class',
+               default='cinder.consistencygroup.api.API',
+               help='The full class name of the consistencygroup API class'),
+    cfg.StrOpt('os_privileged_user_name',
+               default=None,
+               help='OpenStack privileged account username. Used for requests '
+                    'to other services (such as Nova) that require an account '
+                    'with special rights.'),
+    cfg.StrOpt('os_privileged_user_password',
+               default=None,
+               help='Password associated with the OpenStack privileged '
+                    'account.',
+               secret=True),
+    cfg.StrOpt('os_privileged_user_tenant',
+               default=None,
+               help='Tenant name associated with the OpenStack privileged '
+                    'account.'),
+]
 
 CONF.register_opts(global_opts)

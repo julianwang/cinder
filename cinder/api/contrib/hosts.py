@@ -15,18 +15,19 @@
 
 """The hosts admin extension."""
 
-
-from oslo.config import cfg
-import webob.exc
 from xml.parsers import expat
+
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
+import webob.exc
 
 from cinder.api import extensions
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _, _LI
 from cinder import utils
 from cinder.volume import api as volume_api
 
@@ -106,13 +107,13 @@ def _list_hosts(req, service=None):
     hosts = []
     for host in services:
         delta = curr_time - (host['updated_at'] or host['created_at'])
-        alive = abs(utils.total_seconds(delta)) <= CONF.service_down_time
+        alive = abs(delta.total_seconds()) <= CONF.service_down_time
         status = (alive and "available") or "unavailable"
         active = 'enabled'
         if host['disabled']:
             active = 'disabled'
-        LOG.debug('status, active and update: %s, %s, %s' %
-                  (status, active, host['updated_at']))
+        LOG.debug('status, active and update: %s, %s, %s',
+                  status, active, host['updated_at'])
         hosts.append({'host_name': host['host'],
                       'service': host['topic'],
                       'zone': host['availability_zone'],
@@ -177,8 +178,8 @@ class HostController(wsgi.Controller):
         """Sets the specified host's ability to accept new volumes."""
         context = req.environ['cinder.context']
         state = "enabled" if enabled else "disabled"
-        LOG.audit(_("Setting host %(host)s to %(state)s."),
-                  {'host': host, 'state': state})
+        LOG.info(_LI("Setting host %(host)s to %(state)s."),
+                 {'host': host, 'state': state})
         result = self.api.set_host_enabled(context,
                                            host=host,
                                            enabled=enabled)
@@ -222,10 +223,10 @@ class HostController(wsgi.Controller):
         snap_count_total = 0
         snap_sum_total = 0
         resources = [{'resource': {'host': host, 'project': '(total)',
-                      'volume_count': str(count),
-                      'total_volume_gb': str(sum),
-                      'snapshot_count': str(snap_count_total),
-                      'total_snapshot_gb': str(snap_sum_total)}}]
+                                   'volume_count': str(count),
+                                   'total_volume_gb': str(sum),
+                                   'snapshot_count': str(snap_count_total),
+                                   'total_snapshot_gb': str(snap_sum_total)}}]
 
         project_ids = [v['project_id'] for v in volume_refs]
         project_ids = list(set(project_ids))
@@ -250,7 +251,7 @@ class HostController(wsgi.Controller):
 
 
 class Hosts(extensions.ExtensionDescriptor):
-    """Admin-only host administration"""
+    """Admin-only host administration."""
 
     name = "Hosts"
     alias = "os-hosts"

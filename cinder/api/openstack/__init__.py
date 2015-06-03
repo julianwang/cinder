@@ -18,11 +18,11 @@
 WSGI middleware for OpenStack API controllers.
 """
 
+from oslo_log import log as logging
 import routes
 
 from cinder.api.openstack import wsgi
-from cinder.openstack.common import log as logging
-from cinder import utils
+from cinder.i18n import _, _LW
 from cinder import wsgi as base_wsgi
 
 
@@ -35,6 +35,15 @@ class APIMapper(routes.Mapper):
             result = self._match("", environ)
             return result[0], result[1]
         return routes.Mapper.routematch(self, url, environ)
+
+    def connect(self, *args, **kwargs):
+        # NOTE(inhye): Default the format part of a route to only accept json
+        #             and xml so it doesn't eat all characters after a '.'
+        #             in the url.
+        kwargs.setdefault('requirements', {})
+        if not kwargs['requirements'].get('format'):
+            kwargs['requirements']['format'] = 'json|xml'
+        return routes.Mapper.connect(self, *args, **kwargs)
 
 
 class ProjectMapper(APIMapper):
@@ -59,7 +68,7 @@ class APIRouter(base_wsgi.Router):
 
     @classmethod
     def factory(cls, global_config, **local_config):
-        """Simple paste factory, :class:`cinder.wsgi.Router` doesn't have"""
+        """Simple paste factory, :class:`cinder.wsgi.Router` doesn't have."""
         return cls()
 
     def __init__(self, ext_mgr=None):
@@ -78,7 +87,7 @@ class APIRouter(base_wsgi.Router):
 
     def _setup_ext_routes(self, mapper, ext_mgr):
         for resource in ext_mgr.get_resources():
-            LOG.debug(_('Extended resource: %s'),
+            LOG.debug('Extended resource: %s',
                       resource.collection)
 
             wsgi_resource = wsgi.Resource(resource.controller)
@@ -102,14 +111,14 @@ class APIRouter(base_wsgi.Router):
             controller = extension.controller
 
             if collection not in self.resources:
-                LOG.warning(_('Extension %(ext_name)s: Cannot extend '
-                              'resource %(collection)s: No such resource'),
+                LOG.warning(_LW('Extension %(ext_name)s: Cannot extend '
+                                'resource %(collection)s: No such resource'),
                             {'ext_name': extension.extension.name,
                              'collection': collection})
                 continue
 
-            LOG.debug(_('Extension %(ext_name)s extending resource: '
-                        '%(collection)s'),
+            LOG.debug('Extension %(ext_name)s extending resource: '
+                      '%(collection)s',
                       {'ext_name': extension.extension.name,
                        'collection': collection})
 
@@ -119,13 +128,3 @@ class APIRouter(base_wsgi.Router):
 
     def _setup_routes(self, mapper, ext_mgr):
         raise NotImplementedError
-
-
-class FaultWrapper(base_wsgi.Middleware):
-
-    def __init__(self, application):
-        LOG.warn(_('cinder.api.openstack:FaultWrapper is deprecated. Please '
-                   'use cinder.api.middleware.fault:FaultWrapper instead.'))
-        # Avoid circular imports from here. Can I just remove this class?
-        from cinder.api.middleware import fault
-        super(FaultWrapper, self).__init__(fault.FaultWrapper(application))

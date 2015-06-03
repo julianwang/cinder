@@ -16,6 +16,9 @@
 """The volumes api."""
 
 import ast
+
+from oslo_log import log as logging
+from oslo_utils import uuidutils
 import webob
 from webob import exc
 
@@ -23,10 +26,10 @@ from cinder.api import common
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import exception
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import uuidutils
+from cinder.i18n import _, _LI
 from cinder import utils
 from cinder import volume as cinder_volume
+from cinder.volume import utils as volume_utils
 from cinder.volume import volume_types
 
 
@@ -45,18 +48,18 @@ def _translate_attachment_detail_view(_context, vol):
 
 def _translate_attachment_summary_view(_context, vol):
     """Maps keys for attachment summary view."""
-    d = {}
-
-    volume_id = vol['id']
-
-    # NOTE(justinsb): We use the volume id as the id of the attachment object
-    d['id'] = volume_id
-
-    d['volume_id'] = volume_id
-    d['server_id'] = vol['instance_uuid']
-    d['host_name'] = vol['attached_host']
-    if vol.get('mountpoint'):
-        d['device'] = vol['mountpoint']
+    d = []
+    attachments = vol.get('volume_attachment', [])
+    for attachment in attachments:
+        if attachment.get('attach_status') == 'attached':
+            a = {'id': attachment.get('volume_id'),
+                 'attachment_id': attachment.get('id'),
+                 'volume_id': attachment.get('volume_id'),
+                 'server_id': attachment.get('instance_uuid'),
+                 'host_name': attachment.get('attached_host'),
+                 'device': attachment.get('mountpoint'),
+                 }
+            d.append(a)
 
     return d
 
@@ -88,10 +91,14 @@ def _translate_volume_summary_view(context, vol, image_id=None):
     else:
         d['bootable'] = 'false'
 
+    if vol['multiattach']:
+        d['multiattach'] = 'true'
+    else:
+        d['multiattach'] = 'false'
+
     d['attachments'] = []
     if vol['attach_status'] == 'attached':
-        attachment = _translate_attachment_detail_view(context, vol)
-        d['attachments'].append(attachment)
+        d['attachments'] = _translate_attachment_detail_view(context, vol)
 
     d['display_name'] = vol['display_name']
     d['display_description'] = vol['display_description']
@@ -99,20 +106,21 @@ def _translate_volume_summary_view(context, vol, image_id=None):
     if vol['volume_type_id'] and vol.get('volume_type'):
         d['volume_type'] = vol['volume_type']['name']
     else:
-        # TODO(bcwaldon): remove str cast once we use uuids
-        d['volume_type'] = str(vol['volume_type_id'])
+        d['volume_type'] = vol['volume_type_id']
 
     d['snapshot_id'] = vol['snapshot_id']
     d['source_volid'] = vol['source_volid']
 
+    d['encrypted'] = vol['encryption_key_id'] is not None
+
     if image_id:
         d['image_id'] = image_id
 
-    LOG.audit(_("vol=%s"), vol, context=context)
+    LOG.info(_LI("vol=%s"), vol, context=context)
 
     if vol.get('volume_metadata'):
         metadata = vol.get('volume_metadata')
-        d['metadata'] = dict((item['key'], item['value']) for item in metadata)
+        d['metadata'] = {item['key']: item['value'] for item in metadata}
     # avoid circular ref when vol is a Volume instance
     elif vol.get('metadata') and isinstance(vol.get('metadata'), dict):
         d['metadata'] = vol['metadata']
@@ -142,6 +150,7 @@ def make_volume(elem):
     elem.set('volume_type')
     elem.set('snapshot_id')
     elem.set('source_volid')
+    elem.set('multiattach')
 
     attachments = xmlutil.SubTemplateElement(elem, 'attachments')
     attachment = xmlutil.SubTemplateElement(attachments, 'attachment',
@@ -215,58 +224,10 @@ class CreateDeserializer(CommonDeserializer):
 class VolumeController(wsgi.Controller):
     """The Volumes API controller for the OpenStack API."""
 
-    _visible_admin_metadata_keys = ['readonly', 'attached_mode']
-
     def __init__(self, ext_mgr):
         self.volume_api = cinder_volume.API()
         self.ext_mgr = ext_mgr
         super(VolumeController, self).__init__()
-
-    def _add_visible_admin_metadata(self, context, volume):
-        if context is None:
-            return
-
-        visible_admin_meta = {}
-
-        if context.is_admin:
-            volume_tmp = volume
-        else:
-            try:
-                volume_tmp = self.volume_api.get(context.elevated(),
-                                                 volume['id'])
-            except Exception:
-                return
-
-        if volume_tmp.get('volume_admin_metadata'):
-            for item in volume_tmp['volume_admin_metadata']:
-                if item['key'] in self._visible_admin_metadata_keys:
-                    visible_admin_meta[item['key']] = item['value']
-        # avoid circular ref when volume is a Volume instance
-        elif (volume_tmp.get('admin_metadata') and
-                isinstance(volume_tmp.get('admin_metadata'), dict)):
-            for key in self._visible_admin_metadata_keys:
-                if key in volume_tmp['admin_metadata'].keys():
-                    visible_admin_meta[key] = volume_tmp['admin_metadata'][key]
-
-        if not visible_admin_meta:
-            return
-
-        # NOTE(zhiyan): update visible administration metadata to
-        # volume metadata, administration metadata will rewrite existing key.
-        if volume.get('volume_metadata'):
-            orig_meta = list(volume.get('volume_metadata'))
-            for item in orig_meta:
-                if item['key'] in visible_admin_meta.keys():
-                    item['value'] = visible_admin_meta.pop(item['key'])
-            for key, value in visible_admin_meta.iteritems():
-                orig_meta.append({'key': key, 'value': value})
-            volume['volume_metadata'] = orig_meta
-        # avoid circular ref when vol is a Volume instance
-        elif (volume.get('metadata') and
-                isinstance(volume.get('metadata'), dict)):
-            volume['metadata'].update(visible_admin_meta)
-        else:
-            volume['metadata'] = visible_admin_meta
 
     @wsgi.serializers(xml=VolumeTemplate)
     def show(self, req, id):
@@ -274,12 +235,12 @@ class VolumeController(wsgi.Controller):
         context = req.environ['cinder.context']
 
         try:
-            vol = self.volume_api.get(context, id)
-            req.cache_resource(vol)
+            vol = self.volume_api.get(context, id, viewable_admin_meta=True)
+            req.cache_db_volume(vol)
         except exception.NotFound:
             raise exc.HTTPNotFound()
 
-        self._add_visible_admin_metadata(context, vol)
+        utils.add_visible_admin_metadata(vol)
 
         return {'volume': _translate_volume_detail_view(context, vol)}
 
@@ -287,7 +248,7 @@ class VolumeController(wsgi.Controller):
         """Delete a volume."""
         context = req.environ['cinder.context']
 
-        LOG.audit(_("Delete volume with id: %s"), id, context=context)
+        LOG.info(_LI("Delete volume with id: %s"), id, context=context)
 
         try:
             volume = self.volume_api.get(context, id)
@@ -309,29 +270,36 @@ class VolumeController(wsgi.Controller):
     def _items(self, req, entity_maker):
         """Returns a list of volumes, transformed through entity_maker."""
 
-        #pop out limit and offset , they are not search_opts
+        # pop out limit and offset , they are not search_opts
         search_opts = req.GET.copy()
         search_opts.pop('limit', None)
         search_opts.pop('offset', None)
 
-        if 'metadata' in search_opts:
-            search_opts['metadata'] = ast.literal_eval(search_opts['metadata'])
+        for k, v in search_opts.iteritems():
+            try:
+                search_opts[k] = ast.literal_eval(v)
+            except (ValueError, SyntaxError):
+                LOG.debug('Could not evaluate value %s, assuming string', v)
 
         context = req.environ['cinder.context']
-        remove_invalid_options(context,
-                               search_opts, self._get_volume_search_options())
+        utils.remove_invalid_filter_options(context,
+                                            search_opts,
+                                            self._get_volume_search_options())
 
         volumes = self.volume_api.get_all(context, marker=None, limit=None,
-                                          sort_key='created_at',
-                                          sort_dir='desc', filters=search_opts)
+                                          sort_keys=['created_at'],
+                                          sort_dirs=['desc'],
+                                          filters=search_opts,
+                                          viewable_admin_meta=True)
 
         volumes = [dict(vol.iteritems()) for vol in volumes]
 
         for volume in volumes:
-            self._add_visible_admin_metadata(context, volume)
+            utils.add_visible_admin_metadata(volume)
 
         limited_list = common.limited(volumes, req)
-        req.cache_resource(limited_list)
+        req.cache_db_volumes(limited_list)
+
         res = [entity_maker(context, vol) for vol in limited_list]
         return {'volumes': res}
 
@@ -409,14 +377,16 @@ class VolumeController(wsgi.Controller):
         elif size is None and kwargs['source_volume'] is not None:
             size = kwargs['source_volume']['size']
 
-        LOG.audit(_("Create volume of %s GB"), size, context=context)
+        LOG.info(_LI("Create volume of %s GB"), size, context=context)
+        multiattach = volume.get('multiattach', False)
+        kwargs['multiattach'] = multiattach
 
         image_href = None
         image_uuid = None
         if self.ext_mgr.is_loaded('os-image-create'):
             # NOTE(jdg): misleading name "imageRef" as it's an image-id
             image_href = volume.get('imageRef')
-            if image_href:
+            if image_href is not None:
                 image_uuid = self._image_uuid_from_href(image_href)
                 kwargs['image_id'] = image_uuid
 
@@ -432,8 +402,6 @@ class VolumeController(wsgi.Controller):
         #             trying to lazy load, but for now we turn it into
         #             a dict to avoid an error.
         new_volume = dict(new_volume.iteritems())
-
-        self._add_visible_admin_metadata(context, new_volume)
 
         retval = _translate_volume_detail_view(context, new_volume, image_uuid)
 
@@ -468,33 +436,22 @@ class VolumeController(wsgi.Controller):
                 update_dict[key] = volume[key]
 
         try:
-            volume = self.volume_api.get(context, id)
+            volume = self.volume_api.get(context, id, viewable_admin_meta=True)
+            volume_utils.notify_about_volume_usage(context, volume,
+                                                   'update.start')
             self.volume_api.update(context, volume, update_dict)
         except exception.NotFound:
             raise exc.HTTPNotFound()
 
         volume.update(update_dict)
 
-        self._add_visible_admin_metadata(context, volume)
+        utils.add_visible_admin_metadata(volume)
+
+        volume_utils.notify_about_volume_usage(context, volume,
+                                               'update.end')
 
         return {'volume': _translate_volume_detail_view(context, volume)}
 
 
 def create_resource(ext_mgr):
     return wsgi.Resource(VolumeController(ext_mgr))
-
-
-def remove_invalid_options(context, search_options, allowed_search_options):
-    """Remove search options that are not valid for non-admin API/context."""
-    if context.is_admin:
-        # Allow all options
-        return
-    # Otherwise, strip out all unknown options
-    unknown_options = [opt for opt in search_options
-                       if opt not in allowed_search_options]
-    bad_options = ", ".join(unknown_options)
-    log_msg = _("Removing options '%(bad_options)s'"
-                " from query") % {'bad_options': bad_options}
-    LOG.debug(log_msg)
-    for opt in unknown_options:
-        del search_options[opt]

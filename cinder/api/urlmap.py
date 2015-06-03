@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,12 +13,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import paste.urlmap
 import re
 import urllib2
 
+from oslo_log import log as logging
+import paste.urlmap
+
 from cinder.api.openstack import wsgi
-from cinder.openstack.common import log as logging
 
 
 _quoted_string_re = r'"[^"\\]*(?:\\.[^"\\]*)*"'

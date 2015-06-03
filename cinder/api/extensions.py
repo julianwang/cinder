@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
@@ -18,7 +16,9 @@
 
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 import webob.dec
 import webob.exc
 
@@ -26,8 +26,7 @@ import cinder.api.openstack
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import exception
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
+from cinder.i18n import _LE, _LI, _LW
 import cinder.policy
 
 
@@ -64,6 +63,7 @@ class ExtensionDescriptor(object):
         """Register extension with the extension manager."""
 
         ext_mgr.register(self)
+        self.ext_mgr = ext_mgr
 
     def get_resources(self):
         """List of extensions.ResourceExtension extension objects.
@@ -181,7 +181,7 @@ class ExtensionManager(object):
     """
 
     def __init__(self):
-        LOG.audit(_('Initializing extension manager.'))
+        LOG.info(_LI('Initializing extension manager.'))
 
         self.cls_list = CONF.osapi_volume_extension
         self.extensions = {}
@@ -196,7 +196,7 @@ class ExtensionManager(object):
             return
 
         alias = ext.alias
-        LOG.audit(_('Loaded extension: %s'), alias)
+        LOG.info(_LI('Loaded extension: %s'), alias)
 
         if alias in self.extensions:
             raise exception.Error("Found duplicate extension: %s" % alias)
@@ -234,14 +234,14 @@ class ExtensionManager(object):
     def _check_extension(self, extension):
         """Checks for required methods in extension objects."""
         try:
-            LOG.debug(_('Ext name: %s'), extension.name)
-            LOG.debug(_('Ext alias: %s'), extension.alias)
-            LOG.debug(_('Ext description: %s'),
+            LOG.debug('Ext name: %s', extension.name)
+            LOG.debug('Ext alias: %s', extension.alias)
+            LOG.debug('Ext description: %s',
                       ' '.join(extension.__doc__.strip().split()))
-            LOG.debug(_('Ext namespace: %s'), extension.namespace)
-            LOG.debug(_('Ext updated: %s'), extension.updated)
-        except AttributeError as ex:
-            LOG.exception(_("Exception loading extension: %s"), unicode(ex))
+            LOG.debug('Ext namespace: %s', extension.namespace)
+            LOG.debug('Ext updated: %s', extension.updated)
+        except AttributeError:
+            LOG.exception(_LE("Exception loading extension."))
             return False
 
         return True
@@ -255,13 +255,13 @@ class ExtensionManager(object):
         expected to call the register() method at least once.
         """
 
-        LOG.debug(_("Loading extension %s"), ext_factory)
+        LOG.debug("Loading extension %s", ext_factory)
 
         # Load the factory
         factory = importutils.import_class(ext_factory)
 
         # Call it
-        LOG.debug(_("Calling extension factory %s"), ext_factory)
+        LOG.debug("Calling extension factory %s", ext_factory)
         factory(self)
 
     def _load_extensions(self):
@@ -269,26 +269,13 @@ class ExtensionManager(object):
 
         extensions = list(self.cls_list)
 
-        # NOTE(thingee): Backwards compat for the old extension loader path.
-        # We can drop this post-grizzly in the H release.
-        old_contrib_path = ('cinder.api.openstack.volume.contrib.'
-                            'standard_extensions')
-        new_contrib_path = 'cinder.api.contrib.standard_extensions'
-        if old_contrib_path in extensions:
-            LOG.warn(_('osapi_volume_extension is set to deprecated path: %s'),
-                     old_contrib_path)
-            LOG.warn(_('Please set your flag or cinder.conf settings for '
-                       'osapi_volume_extension to: %s'), new_contrib_path)
-            extensions = [e.replace(old_contrib_path, new_contrib_path)
-                          for e in extensions]
-
         for ext_factory in extensions:
             try:
                 self.load_extension(ext_factory)
             except Exception as exc:
-                LOG.warn(_('Failed to load extension %(ext_factory)s: '
-                           '%(exc)s'),
-                         {'ext_factory': ext_factory, 'exc': exc})
+                LOG.warning(_LW('Failed to load extension %(ext_factory)s: '
+                                '%(exc)s'),
+                            {'ext_factory': ext_factory, 'exc': exc})
 
 
 class ControllerExtension(object):
@@ -355,9 +342,9 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
             try:
                 ext_mgr.load_extension(classpath)
             except Exception as exc:
-                logger.warn(_('Failed to load extension %(classpath)s: '
-                              '%(exc)s'),
-                            {'classpath': classpath, 'exc': exc})
+                logger.warning(_LW('Failed to load extension %(classpath)s: '
+                                   '%(exc)s'),
+                               {'classpath': classpath, 'exc': exc})
 
         # Now, let's consider any subdirectories we may have...
         subdirs = []
@@ -380,21 +367,24 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
                 try:
                     ext(ext_mgr)
                 except Exception as exc:
-                    logger.warn(_('Failed to load extension %(ext_name)s: '
-                                  '%(exc)s'),
-                                {'ext_name': ext_name, 'exc': exc})
+                    logger.warning(_LW('Failed to load extension '
+                                       '%(ext_name)s: %(exc)s'),
+                                   {'ext_name': ext_name, 'exc': exc})
 
         # Update the list of directories we'll explore...
         dirnames[:] = subdirs
 
 
 def extension_authorizer(api_name, extension_name):
-    def authorize(context, target=None):
+    def authorize(context, target=None, action=None):
         if target is None:
             target = {'project_id': context.project_id,
                       'user_id': context.user_id}
-        action = '%s_extension:%s' % (api_name, extension_name)
-        cinder.policy.enforce(context, action, target)
+        if action is None:
+            act = '%s_extension:%s' % (api_name, extension_name)
+        else:
+            act = '%s_extension:%s:%s' % (api_name, extension_name, action)
+        cinder.policy.enforce(context, act, target)
     return authorize
 
 

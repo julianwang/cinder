@@ -20,6 +20,7 @@ from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
+from cinder.i18n import _
 from cinder import quota
 
 
@@ -45,7 +46,7 @@ class QuotaClassTemplate(xmlutil.TemplateBuilder):
 class QuotaClassSetsController(wsgi.Controller):
 
     def _format_quota_set(self, quota_class, quota_set):
-        """Convert the quota object to a result dict"""
+        """Convert the quota object to a result dict."""
 
         quota_set['id'] = str(quota_class)
 
@@ -95,7 +96,7 @@ class QuotaClassSetsController(wsgi.Controller):
 
 
 class Quota_classes(extensions.ExtensionDescriptor):
-    """Quota classes management support"""
+    """Quota classes management support."""
 
     name = "QuotaClasses"
     alias = "os-quota-class-sets"

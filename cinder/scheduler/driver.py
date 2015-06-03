@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -21,12 +19,12 @@
 Scheduler base class that all Schedulers should inherit from
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_utils import importutils
+from oslo_utils import timeutils
 
 from cinder import db
-from cinder.openstack.common import importutils
-from cinder.openstack.common import timeutils
-from cinder import utils
+from cinder.i18n import _
 from cinder.volume import rpcapi as volume_rpcapi
 
 
@@ -53,6 +51,16 @@ def volume_update_db(context, volume_id, host):
     return db.volume_update(context, volume_id, values)
 
 
+def group_update_db(context, group_id, host):
+    """Set the host and the scheduled_at field of a consistencygroup.
+
+    :returns: A Consistencygroup with the updated fields set properly.
+    """
+    now = timeutils.utcnow()
+    values = {'host': host, 'updated_at': now}
+    return db.consistencygroup_update(context, group_id, values)
+
+
 class Scheduler(object):
     """The base class that all Scheduler classes should inherit from."""
 
@@ -61,23 +69,29 @@ class Scheduler(object):
             CONF.scheduler_host_manager)
         self.volume_rpcapi = volume_rpcapi.VolumeAPI()
 
+    def is_ready(self):
+        """Returns True if Scheduler is ready to accept requests.
+
+        This is to handle scheduler service startup when it has no volume hosts
+        stats and will fail all the requests.
+        """
+
+        return self.host_manager.has_all_capabilities()
+
     def update_service_capabilities(self, service_name, host, capabilities):
         """Process a capability update from a service node."""
         self.host_manager.update_service_capabilities(service_name,
                                                       host,
                                                       capabilities)
 
-    def hosts_up(self, context, topic):
-        """Return the list of hosts that have a running service for topic."""
-
-        services = db.service_get_all_by_topic(context, topic)
-        return [service['host']
-                for service in services
-                if utils.service_is_up(service)]
-
     def host_passes_filters(self, context, volume_id, host, filter_properties):
         """Check if the specified host passes the filters."""
         raise NotImplementedError(_("Must implement host_passes_filters"))
+
+    def find_retype_host(self, context, request_spec, filter_properties=None,
+                         migration_policy='never'):
+        """Find a host that can accept the volume with its new type."""
+        raise NotImplementedError(_("Must implement find_retype_host"))
 
     def schedule(self, context, topic, method, *_args, **_kwargs):
         """Must override schedule method for scheduler to work."""
@@ -86,3 +100,15 @@ class Scheduler(object):
     def schedule_create_volume(self, context, request_spec, filter_properties):
         """Must override schedule method for scheduler to work."""
         raise NotImplementedError(_("Must implement schedule_create_volume"))
+
+    def schedule_create_consistencygroup(self, context, group_id,
+                                         request_spec_list,
+                                         filter_properties_list):
+        """Must override schedule method for scheduler to work."""
+        raise NotImplementedError(_(
+            "Must implement schedule_create_consistencygroup"))
+
+    def get_pools(self, context, filters):
+        """Must override schedule method for scheduler to work."""
+        raise NotImplementedError(_(
+            "Must implement schedule_get_pools"))

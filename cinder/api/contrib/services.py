@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 IBM Corp.
 # All Rights Reserved.
 #
@@ -16,7 +14,9 @@
 #    under the License.
 
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 import webob.exc
 
 from cinder.api import extensions
@@ -24,8 +24,8 @@ from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _
+from cinder.openstack.common import versionutils
 from cinder import utils
 
 
@@ -45,6 +45,7 @@ class ServicesIndexTemplate(xmlutil.TemplateBuilder):
         elem.set('status')
         elem.set('state')
         elem.set('update_at')
+        elem.set('disabled_reason')
 
         return xmlutil.MasterTemplate(root, 1)
 
@@ -61,11 +62,16 @@ class ServicesUpdateTemplate(xmlutil.TemplateBuilder):
         root.set('disabled')
         root.set('binary')
         root.set('status')
+        root.set('disabled_reason')
 
         return xmlutil.MasterTemplate(root, 1)
 
 
 class ServiceController(wsgi.Controller):
+    def __init__(self, ext_mgr=None):
+        self.ext_mgr = ext_mgr
+        super(ServiceController, self).__init__()
+
     @wsgi.serializers(xml=ServicesIndexTemplate)
     def index(self, req):
         """Return a list of all running services.
@@ -74,6 +80,7 @@ class ServiceController(wsgi.Controller):
         """
         context = req.environ['cinder.context']
         authorize(context)
+        detailed = self.ext_mgr.is_loaded('os-extended-services')
         now = timeutils.utcnow()
         services = db.service_get_all(context)
 
@@ -83,8 +90,9 @@ class ServiceController(wsgi.Controller):
         service = ''
         if 'service' in req.GET:
             service = req.GET['service']
-            LOG.deprecated(_("Query by service parameter is deprecated. "
-                             "Please use binary parameter instead."))
+            versionutils.report_deprecated_feature(LOG, _(
+                "Query by service parameter is deprecated. "
+                "Please use binary parameter instead."))
         binary = ''
         if 'binary' in req.GET:
             binary = req.GET['binary']
@@ -98,35 +106,71 @@ class ServiceController(wsgi.Controller):
 
         svcs = []
         for svc in services:
+            updated_at = svc['updated_at']
             delta = now - (svc['updated_at'] or svc['created_at'])
-            alive = abs(utils.total_seconds(delta)) <= CONF.service_down_time
+            delta_sec = delta.total_seconds()
+            if svc['modified_at']:
+                delta_mod = now - svc['modified_at']
+                if abs(delta_sec) >= abs(delta_mod.total_seconds()):
+                    updated_at = svc['modified_at']
+            alive = abs(delta_sec) <= CONF.service_down_time
             art = (alive and "up") or "down"
             active = 'enabled'
             if svc['disabled']:
                 active = 'disabled'
-            svcs.append({"binary": svc['binary'], 'host': svc['host'],
-                         'zone': svc['availability_zone'],
-                         'status': active, 'state': art,
-                         'updated_at': svc['updated_at']})
+            ret_fields = {'binary': svc['binary'], 'host': svc['host'],
+                          'zone': svc['availability_zone'],
+                          'status': active, 'state': art,
+                          'updated_at': updated_at}
+            if detailed:
+                ret_fields['disabled_reason'] = svc['disabled_reason']
+            svcs.append(ret_fields)
         return {'services': svcs}
+
+    def _is_valid_as_reason(self, reason):
+        if not reason:
+            return False
+        try:
+            utils.check_string_length(reason.strip(), 'Disabled reason',
+                                      min_length=1, max_length=255)
+        except exception.InvalidInput:
+            return False
+
+        return True
 
     @wsgi.serializers(xml=ServicesUpdateTemplate)
     def update(self, req, id, body):
-        """Enable/Disable scheduling for a service"""
+        """Enable/Disable scheduling for a service."""
         context = req.environ['cinder.context']
         authorize(context)
 
+        ext_loaded = self.ext_mgr.is_loaded('os-extended-services')
+        ret_val = {}
         if id == "enable":
             disabled = False
-        elif id == "disable":
+            status = "enabled"
+            if ext_loaded:
+                ret_val['disabled_reason'] = None
+        elif (id == "disable" or
+                (id == "disable-log-reason" and ext_loaded)):
             disabled = True
+            status = "disabled"
         else:
-            raise webob.exc.HTTPNotFound("Unknown action")
+            raise webob.exc.HTTPNotFound(explanation=_("Unknown action"))
 
         try:
             host = body['host']
         except (TypeError, KeyError):
             raise webob.exc.HTTPBadRequest()
+
+        ret_val['disabled'] = disabled
+        if id == "disable-log-reason" and ext_loaded:
+            reason = body.get('disabled_reason')
+            if not self._is_valid_as_reason(reason):
+                msg = _('Disabled reason contains invalid characters '
+                        'or is too long')
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+            ret_val['disabled_reason'] = reason
 
         # NOTE(uni): deprecating service request key, binary takes precedence
         # Still keeping service key here for API compatibility sake.
@@ -139,22 +183,19 @@ class ServiceController(wsgi.Controller):
         try:
             svc = db.service_get_by_args(context, host, binary_key)
             if not svc:
-                raise webob.exc.HTTPNotFound('Unknown service')
+                raise webob.exc.HTTPNotFound(explanation=_('Unknown service'))
 
-            db.service_update(context, svc['id'], {'disabled': disabled})
+            db.service_update(context, svc['id'], ret_val)
         except exception.ServiceNotFound:
-            raise webob.exc.HTTPNotFound("service not found")
+            raise webob.exc.HTTPNotFound(explanation=_("service not found"))
 
-        status = id + 'd'
-        return {'host': host,
-                'service': service,
-                'disabled': disabled,
-                'binary': binary,
-                'status': status}
+        ret_val.update({'host': host, 'service': service,
+                        'binary': binary, 'status': status})
+        return ret_val
 
 
 class Services(extensions.ExtensionDescriptor):
-    """Services support"""
+    """Services support."""
 
     name = "Services"
     alias = "os-services"
@@ -163,7 +204,7 @@ class Services(extensions.ExtensionDescriptor):
 
     def get_resources(self):
         resources = []
-        resource = extensions.ResourceExtension('os-services',
-                                                ServiceController())
+        controller = ServiceController(self.ext_mgr)
+        resource = extensions.ResourceExtension('os-services', controller)
         resources.append(resource)
         return resources

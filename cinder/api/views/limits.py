@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -16,8 +14,6 @@
 #    under the License.
 
 import datetime
-
-from cinder.openstack.common import timeutils
 
 
 class ViewBuilder(object):
@@ -48,7 +44,10 @@ class ViewBuilder(object):
             "instances": ["maxTotalInstances"],
             "cores": ["maxTotalCores"],
             "gigabytes": ["maxTotalVolumeGigabytes"],
+            "backup_gigabytes": ["maxTotalBackupGigabytes"],
             "volumes": ["maxTotalVolumes"],
+            "snapshots": ["maxTotalSnapshots"],
+            "backups": ["maxTotalBackups"],
             "key_pairs": ["maxTotalKeypairs"],
             "floating_ips": ["maxTotalFloatingIps"],
             "metadata_items": ["maxServerMeta", "maxImageMeta"],
@@ -96,5 +95,5 @@ class ViewBuilder(object):
             "value": rate_limit["value"],
             "remaining": int(rate_limit["remaining"]),
             "unit": rate_limit["unit"],
-            "next-available": timeutils.isotime(at=next_avail),
+            "next-available": next_avail.isoformat(),
         }

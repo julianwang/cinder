@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -12,10 +10,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 from sqlalchemy import Boolean, Column, DateTime
 from sqlalchemy import Integer, MetaData, String, Table, ForeignKey
 
-from cinder.openstack.common import log as logging
+from cinder.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -24,7 +23,7 @@ def upgrade(migrate_engine):
     meta = MetaData()
     meta.bind = migrate_engine
 
-    snapshots = Table('snapshots', meta, autoload=True)
+    Table('snapshots', meta, autoload=True)
 
     # New table
     snapshot_metadata = Table(
@@ -44,7 +43,7 @@ def upgrade(migrate_engine):
     try:
         snapshot_metadata.create()
     except Exception:
-        LOG.error(_("Table |%s| not created!"), repr(snapshot_metadata))
+        LOG.error(_LE("Table |%s| not created!"), repr(snapshot_metadata))
         raise
 
 
@@ -57,5 +56,5 @@ def downgrade(migrate_engine):
     try:
         snapshot_metadata.drop()
     except Exception:
-        LOG.error(_("snapshot_metadata table not dropped"))
+        LOG.error(_LE("snapshot_metadata table not dropped"))
         raise

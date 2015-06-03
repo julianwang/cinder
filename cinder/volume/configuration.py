@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright (c) 2012 Rackspace Hosting
 # All Rights Reserved.
 #
@@ -43,9 +40,8 @@ and registered in the group in which they are used.
 """
 
 
-from oslo.config import cfg
-
-from cinder.openstack.common import log as logging
+from oslo_config import cfg
+from oslo_log import log as logging
 
 
 CONF = cfg.CONF

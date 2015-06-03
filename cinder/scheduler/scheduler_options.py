@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -26,10 +24,11 @@ import datetime
 import json
 import os
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _LE
 
 
 scheduler_json_config_location_opt = cfg.StrOpt(
@@ -66,18 +65,18 @@ class SchedulerOptions(object):
         """Get the last modified datetime. Broken out for testing."""
         try:
             return os.path.getmtime(filename)
-        except os.error as e:
-            LOG.exception(_("Could not stat scheduler options file "
-                            "%(filename)s: '%(e)s'"),
-                          {'filename': filename, 'e': e})
+        except os.error:
+            LOG.exception(_LE("Could not stat scheduler options file "
+                              "%(filename)s."),
+                          {'filename': filename})
             raise
 
     def _load_file(self, handle):
         """Decode the JSON file. Broken out for testing."""
         try:
             return json.load(handle)
-        except ValueError as e:
-            LOG.exception(_("Could not decode scheduler options: '%s'") % e)
+        except ValueError:
+            LOG.exception(_LE("Could not decode scheduler options."))
             return {}
 
     def _get_time_now(self):

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -36,12 +34,15 @@ class UsedLimitsController(wsgi.Controller):
         quota_map = {
             'totalVolumesUsed': 'volumes',
             'totalGigabytesUsed': 'gigabytes',
+            'totalSnapshotsUsed': 'snapshots',
+            'totalBackupsUsed': 'backups',
+            'totalBackupGigabytesUsed': 'backup_gigabytes'
         }
 
         used_limits = {}
-        for display_name, quota in quota_map.iteritems():
-            if quota in quotas:
-                used_limits[display_name] = quotas[quota]['in_use']
+        for display_name, single_quota in quota_map.iteritems():
+            if single_quota in quotas:
+                used_limits[display_name] = quotas[single_quota]['in_use']
 
         resp_obj.obj['limits']['absolute'].update(used_limits)
 

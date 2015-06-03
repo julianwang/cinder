@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -16,9 +14,12 @@
 #    under the License.
 
 import os.path
+import re
 
 from lxml import etree
+import six
 
+from cinder.i18n import _
 from cinder import utils
 
 
@@ -26,9 +27,12 @@ XMLNS_V10 = 'http://docs.rackspacecloud.com/servers/api/v1.0'
 XMLNS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
 XMLNS_COMMON_V10 = 'http://docs.openstack.org/common/api/v1.0'
 XMLNS_ATOM = 'http://www.w3.org/2005/Atom'
-XMLNS_VOLUME_V1 = 'http://docs.openstack.org/volume/api/v1'
-XMLNS_VOLUME_V2 = ('http://docs.openstack.org/api/openstack-volume/2.0/'
+XMLNS_VOLUME_V1 = ('http://docs.openstack.org/api/openstack-block-storage/1.0/'
                    'content')
+XMLNS_VOLUME_V2 = ('http://docs.openstack.org/api/openstack-block-storage/2.0/'
+                   'content')
+
+_split_pattern = re.compile(r'([^:{]*{[^}]*}[^:]*|[^:]+)')
 
 
 def validate_schema(xml, schema_name):
@@ -335,20 +339,20 @@ class TemplateElement(object):
 
         # Start with the text...
         if self.text is not None:
-            elem.text = unicode(self.text(obj))
+            elem.text = six.text_type(self.text(obj))
 
         # Now set up all the attributes...
         for key, value in self.attrib.items():
             try:
-                elem.set(key, unicode(value(obj, True)))
+                elem.set(key, six.text_type(value(obj, True)))
             except KeyError:
                 # Attribute has no value, so don't include it
                 pass
 
     def getAttrib(self, obj):
-        """Get attribute"""
+        """Get attribute."""
         tmpattrib = {}
-        #Now set up all the attributes...
+        # Now set up all the attributes...
         for key, value in self.attrib.items():
             try:
                 tmpattrib[key] = value(obj)
@@ -356,6 +360,10 @@ class TemplateElement(object):
                 # Attribute has no value, so don't include it
                 pass
         return tmpattrib
+
+    @staticmethod
+    def _splitTagName(name):
+        return _split_pattern.findall(name)
 
     def _render(self, parent, datum, patches, nsmap):
         """Internal rendering.
@@ -383,10 +391,10 @@ class TemplateElement(object):
         else:
             tmpattrib = {}
 
-        tagnameList = tagname.split(':')
+        tagnameList = self._splitTagName(tagname)
         insertIndex = 0
 
-        #If parent is not none and has same tagname
+        # If parent is not none and has same tagname
         if parent is not None:
             for i in range(0, len(tagnameList)):
                 tmpInsertPos = parent.find(tagnameList[i])
@@ -400,19 +408,19 @@ class TemplateElement(object):
         if insertIndex >= len(tagnameList):
             insertIndex = insertIndex - 1
 
-        #Create root elem
+        # Create root elem
         elem = etree.Element(tagnameList[insertIndex], nsmap=nsmap)
         rootelem = elem
         subelem = elem
 
-        #Create subelem
+        # Create subelem
         for i in range((insertIndex + 1), len(tagnameList)):
             subelem = etree.SubElement(elem, tagnameList[i])
             elem = subelem
 
         # If we have a parent, append the node to the parent
         if parent is not None:
-            #If we can merge this element, then insert
+            # If we can merge this element, then insert
             if insertIndex > 0:
                 parent.insert(len(list(parent)), rootelem)
             else:
@@ -432,7 +440,7 @@ class TemplateElement(object):
         # We have fully rendered the element; return it
         return rootelem
 
-    def render(self, parent, obj, patches=[], nsmap=None):
+    def render(self, parent, obj, patches=None, nsmap=None):
         """Render an object.
 
         Renders an object against this template node.  Returns a list
@@ -449,6 +457,7 @@ class TemplateElement(object):
                       the etree.Element instances.
         """
 
+        patches = patches or []
         # First, get the datum we're rendering
         data = None if obj is None else self.selector(obj)
 

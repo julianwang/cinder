@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 Huawei Technologies Co., Ltd.
 # Copyright (c) 2012 OpenStack LLC.
 # All Rights Reserved.
@@ -18,8 +16,9 @@
 
 from xml.etree import ElementTree as ET
 
-from cinder import exception
-from cinder.openstack.common import log as logging
+from oslo_log import log as logging
+
+from cinder.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -40,8 +39,8 @@ def parse_xml_file(filepath):
         root = tree.getroot()
         return root
     except IOError as err:
-        LOG.error(_('parse_xml_file: %s') % err)
-        raise err
+        LOG.error(_LE('parse_xml_file: %s'), err)
+        raise
 
 
 def get_xml_item(xml_root, item):
@@ -74,7 +73,6 @@ def is_xml_item_exist(xml_root, item, attrib_key=None):
     :return: True of False
     """
     items_list = get_xml_item(xml_root, item)
-    value = []
     if attrib_key:
         for tmp_dict in items_list:
             if tmp_dict['attrib'].get(attrib_key, None):
@@ -129,7 +127,7 @@ def get_conf_host_os_type(host_ip, config):
     if not host_os:
         host_os = os_type['Linux']  # default os type
 
-    LOG.debug(_('_get_host_os_type: Host %(ip)s OS type is %(os)s.')
-              % {'ip': host_ip, 'os': host_os})
+    LOG.debug('_get_host_os_type: Host %(ip)s OS type is %(os)s.',
+              {'ip': host_ip, 'os': host_os})
 
     return host_os

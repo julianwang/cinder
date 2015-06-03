@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Justin Santa Barbara
@@ -22,39 +20,33 @@
 
 import contextlib
 import datetime
-import functools
 import hashlib
 import inspect
 import os
 import pyclbr
-import random
 import re
 import shutil
 import stat
 import sys
 import tempfile
-import time
 from xml.dom import minidom
 from xml.parsers import expat
 from xml import sax
 from xml.sax import expatreader
 from xml.sax import saxutils
 
-from eventlet import event
-from eventlet import greenthread
-from eventlet import pools
-from oslo.config import cfg
-import paramiko
+from os_brick.initiator import connector
+from oslo_concurrency import lockutils
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
+import retrying
+import six
 
-from cinder.brick.initiator import connector
 from cinder import exception
-from cinder.openstack.common import excutils
-from cinder.openstack.common import gettextutils
-from cinder.openstack.common import importutils
-from cinder.openstack.common import lockutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder.openstack.common import timeutils
+from cinder.i18n import _, _LE
 
 
 CONF = cfg.CONF
@@ -105,6 +97,14 @@ def as_int(obj, quiet=True):
     return obj
 
 
+def is_int_like(val):
+    """Check if a value looks like an int."""
+    try:
+        return str(int(val)) == str(val)
+    except Exception:
+        return False
+
+
 def check_exclusive_options(**kwargs):
     """Checks that only one of the provided options is actually not-none.
 
@@ -138,7 +138,7 @@ def check_exclusive_options(**kwargs):
 
 def execute(*cmd, **kwargs):
     """Convenience wrapper around oslo's execute() method."""
-    if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
+    if 'run_as_root' in kwargs and 'root_helper' not in kwargs:
         kwargs['root_helper'] = get_root_helper()
     return processutils.execute(*cmd, **kwargs)
 
@@ -159,17 +159,17 @@ def check_ssh_injection(cmd_list):
             if quoted:
                 if (re.match('[\'"]', quoted) or
                         re.search('[^\\\\][\'"]', quoted)):
-                    raise exception.SSHInjectionThreat(command=str(cmd_list))
+                    raise exception.SSHInjectionThreat(command=cmd_list)
         else:
             # We only allow spaces within quoted arguments, and that
             # is the only special character allowed within quotes
             if len(arg.split()) > 1:
-                raise exception.SSHInjectionThreat(command=str(cmd_list))
+                raise exception.SSHInjectionThreat(command=cmd_list)
 
         # Second, check whether danger character in command. So the shell
         # special operator must be a single argument.
         for c in ssh_injection_pattern:
-            if arg == c:
+            if c not in arg:
                 continue
 
             result = arg.find(c)
@@ -185,99 +185,9 @@ def create_channel(client, width, height):
     return channel
 
 
-class SSHPool(pools.Pool):
-    """A simple eventlet pool to hold ssh connections."""
-
-    def __init__(self, ip, port, conn_timeout, login, password=None,
-                 privatekey=None, *args, **kwargs):
-        self.ip = ip
-        self.port = port
-        self.login = login
-        self.password = password
-        self.conn_timeout = conn_timeout if conn_timeout else None
-        self.privatekey = privatekey
-        super(SSHPool, self).__init__(*args, **kwargs)
-
-    def create(self):
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            if self.password:
-                ssh.connect(self.ip,
-                            port=self.port,
-                            username=self.login,
-                            password=self.password,
-                            timeout=self.conn_timeout)
-            elif self.privatekey:
-                pkfile = os.path.expanduser(self.privatekey)
-                privatekey = paramiko.RSAKey.from_private_key_file(pkfile)
-                ssh.connect(self.ip,
-                            port=self.port,
-                            username=self.login,
-                            pkey=privatekey,
-                            timeout=self.conn_timeout)
-            else:
-                msg = _("Specify a password or private_key")
-                raise exception.CinderException(msg)
-
-            # Paramiko by default sets the socket timeout to 0.1 seconds,
-            # ignoring what we set through the sshclient. This doesn't help for
-            # keeping long lived connections. Hence we have to bypass it, by
-            # overriding it after the transport is initialized. We are setting
-            # the sockettimeout to None and setting a keepalive packet so that,
-            # the server will keep the connection open. All that does is send
-            # a keepalive packet every ssh_conn_timeout seconds.
-            if self.conn_timeout:
-                transport = ssh.get_transport()
-                transport.sock.settimeout(None)
-                transport.set_keepalive(self.conn_timeout)
-            return ssh
-        except Exception as e:
-            msg = _("Error connecting via ssh: %s") % e
-            LOG.error(msg)
-            raise paramiko.SSHException(msg)
-
-    def get(self):
-        """Return an item from the pool, when one is available.
-
-        This may cause the calling greenthread to block. Check if a
-        connection is active before returning it.
-
-        For dead connections create and return a new connection.
-        """
-        conn = super(SSHPool, self).get()
-        if conn:
-            if conn.get_transport().is_active():
-                return conn
-            else:
-                conn.close()
-        return self.create()
-
-    def remove(self, ssh):
-        """Close an ssh client and remove it from free_items."""
-        ssh.close()
-        ssh = None
-        if ssh in self.free_items:
-            self.free_items.pop(ssh)
-        if self.current_size > 0:
-            self.current_size -= 1
-
-
 def cinderdir():
     import cinder
     return os.path.abspath(cinder.__file__).split('cinder/__init__.py')[0]
-
-
-# Default symbols to use for passwords. Avoids visually confusing characters.
-# ~6 bits per symbol
-DEFAULT_PASSWORD_SYMBOLS = ('23456789',  # Removed: 0,1
-                            'ABCDEFGHJKLMNPQRSTUVWXYZ',   # Removed: I, O
-                            'abcdefghijkmnopqrstuvwxyz')  # Removed: l
-
-
-# ~5 bits per symbol
-EASIER_PASSWORD_SYMBOLS = ('23456789',  # Removed: 0, 1
-                           'ABCDEFGHJKLMNPQRSTUVWXYZ')  # Removed: I, O
 
 
 def last_completed_audit_period(unit=None):
@@ -367,135 +277,6 @@ def last_completed_audit_period(unit=None):
     return (begin, end)
 
 
-def generate_password(length=20, symbolgroups=DEFAULT_PASSWORD_SYMBOLS):
-    """Generate a random password from the supplied symbol groups.
-
-    At least one symbol from each group will be included. Unpredictable
-    results if length is less than the number of symbol groups.
-
-    Believed to be reasonably secure (with a reasonable password length!)
-
-    """
-    r = random.SystemRandom()
-
-    # NOTE(jerdfelt): Some password policies require at least one character
-    # from each group of symbols, so start off with one random character
-    # from each symbol group
-    password = [r.choice(s) for s in symbolgroups]
-    # If length < len(symbolgroups), the leading characters will only
-    # be from the first length groups. Try our best to not be predictable
-    # by shuffling and then truncating.
-    r.shuffle(password)
-    password = password[:length]
-    length -= len(password)
-
-    # then fill with random characters from all symbol groups
-    symbols = ''.join(symbolgroups)
-    password.extend([r.choice(symbols) for _i in xrange(length)])
-
-    # finally shuffle to ensure first x characters aren't from a
-    # predictable group
-    r.shuffle(password)
-
-    return ''.join(password)
-
-
-def generate_username(length=20, symbolgroups=DEFAULT_PASSWORD_SYMBOLS):
-    # Use the same implementation as the password generation.
-    return generate_password(length, symbolgroups)
-
-
-class LazyPluggable(object):
-    """A pluggable backend loaded lazily based on some value."""
-
-    def __init__(self, pivot, **backends):
-        self.__backends = backends
-        self.__pivot = pivot
-        self.__backend = None
-
-    def __get_backend(self):
-        if not self.__backend:
-            backend_name = CONF[self.__pivot]
-            if backend_name not in self.__backends:
-                raise exception.Error(_('Invalid backend: %s') % backend_name)
-
-            backend = self.__backends[backend_name]
-            if isinstance(backend, tuple):
-                name = backend[0]
-                fromlist = backend[1]
-            else:
-                name = backend
-                fromlist = backend
-
-            self.__backend = __import__(name, None, None, fromlist)
-            LOG.debug(_('backend %s'), self.__backend)
-        return self.__backend
-
-    def __getattr__(self, key):
-        backend = self.__get_backend()
-        return getattr(backend, key)
-
-
-class LoopingCallDone(Exception):
-    """Exception to break out and stop a LoopingCall.
-
-    The poll-function passed to LoopingCall can raise this exception to
-    break out of the loop normally. This is somewhat analogous to
-    StopIteration.
-
-    An optional return-value can be included as the argument to the exception;
-    this return-value will be returned by LoopingCall.wait()
-
-    """
-
-    def __init__(self, retvalue=True):
-        """:param retvalue: Value that LoopingCall.wait() should return."""
-        self.retvalue = retvalue
-
-
-class LoopingCall(object):
-    def __init__(self, f=None, *args, **kw):
-        self.args = args
-        self.kw = kw
-        self.f = f
-        self._running = False
-
-    def start(self, interval, initial_delay=None):
-        self._running = True
-        done = event.Event()
-
-        def _inner():
-            if initial_delay:
-                greenthread.sleep(initial_delay)
-
-            try:
-                while self._running:
-                    self.f(*self.args, **self.kw)
-                    if not self._running:
-                        break
-                    greenthread.sleep(interval)
-            except LoopingCallDone as e:
-                self.stop()
-                done.send(e.retvalue)
-            except Exception:
-                LOG.exception(_('in looping call'))
-                done.send_exception(*sys.exc_info())
-                return
-            else:
-                done.send(True)
-
-        self.done = done
-
-        greenthread.spawn(_inner)
-        return self.done
-
-    def stop(self):
-        self._running = False
-
-    def wait(self):
-        return self.done.wait()
-
-
 class ProtectedExpatParser(expatreader.ExpatParser):
     """An expat parser which disables DTD's and entities by default."""
 
@@ -532,7 +313,7 @@ def safe_minidom_parse_string(xml_string):
     """
     try:
         return minidom.parseString(xml_string, parser=ProtectedExpatParser())
-    except sax.SAXParseException as se:
+    except sax.SAXParseException:
         raise expat.ExpatError()
 
 
@@ -603,6 +384,14 @@ def is_valid_boolstr(val):
             val == '1' or val == '0')
 
 
+def is_none_string(val):
+    """Check if a string represents a None value."""
+    if not isinstance(val, six.string_types):
+        return False
+
+    return val.lower() == 'none'
+
+
 def monkey_patch():
     """If the CONF.monkey_patch set as True,
     this function patches a decorator
@@ -668,15 +457,6 @@ def make_dev_path(dev, partition=None, base='/dev'):
     return path
 
 
-def total_seconds(td):
-    """Local total_seconds implementation for compatibility with python 2.6"""
-    if hasattr(td, 'total_seconds'):
-        return td.total_seconds()
-    else:
-        return ((td.days * 86400 + td.seconds) * 10 ** 6 +
-                td.microseconds) / 10.0 ** 6
-
-
 def sanitize_hostname(hostname):
     """Return a hostname which conforms to RFC-952 and RFC-1123 specs."""
     if isinstance(hostname, unicode):
@@ -690,26 +470,6 @@ def sanitize_hostname(hostname):
     return hostname
 
 
-def read_cached_file(filename, cache_info, reload_func=None):
-    """Read from a file if it has been modified.
-
-    :param cache_info: dictionary to hold opaque cache.
-    :param reload_func: optional function to be called with data when
-                        file is reloaded due to a modification.
-
-    :returns: data from file
-
-    """
-    mtime = os.path.getmtime(filename)
-    if not cache_info or mtime != cache_info.get('mtime'):
-        with open(filename) as fap:
-            cache_info['data'] = fap.read()
-        cache_info['mtime'] = mtime
-        if reload_func:
-            reload_func(cache_info['data'])
-    return cache_info['data']
-
-
 def hash_file(file_like_object):
     """Generate a hash for the contents of a file."""
     checksum = hashlib.sha1()
@@ -721,7 +481,7 @@ def service_is_up(service):
     """Check whether a service is up based on last heartbeat."""
     last_heartbeat = service['updated_at'] or service['created_at']
     # Timestamps in DB are UTC.
-    elapsed = total_seconds(timeutils.utcnow() - last_heartbeat)
+    elapsed = (timeutils.utcnow() - last_heartbeat).total_seconds()
     return abs(elapsed) <= CONF.service_down_time
 
 
@@ -763,11 +523,12 @@ def tempdir(**kwargs):
         try:
             shutil.rmtree(tmpdir)
         except OSError as e:
-            LOG.debug(_('Could not remove tmpdir: %s'), str(e))
+            LOG.debug('Could not remove tmpdir: %s',
+                      six.text_type(e))
 
 
 def walk_class_hierarchy(clazz, encountered=None):
-    """Walk class hierarchy, yielding most derived classes first"""
+    """Walk class hierarchy, yielding most derived classes first."""
     if not encountered:
         encountered = []
     for subclass in clazz.__subclasses__():
@@ -783,14 +544,23 @@ def get_root_helper():
     return 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
 
 
-def brick_get_connector_properties():
+def brick_get_connector_properties(multipath=False, enforce_multipath=False):
     """wrapper for the brick calls to automatically set
     the root_helper needed for cinder.
+
+    :param multipath:         A boolean indicating whether the connector can
+                              support multipath.
+    :param enforce_multipath: If True, it raises exception when multipath=True
+                              is specified but multipathd is not running.
+                              If False, it falls back to multipath=False
+                              when multipathd is not running.
     """
 
     root_helper = get_root_helper()
     return connector.get_connector_properties(root_helper,
-                                              CONF.my_ip)
+                                              CONF.my_ip,
+                                              multipath,
+                                              enforce_multipath)
 
 
 def brick_get_connector(protocol, driver=None,
@@ -813,15 +583,19 @@ def brick_get_connector(protocol, driver=None,
                                                 *args, **kwargs)
 
 
-def require_driver_initialized(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        # we can't do anything if the driver didn't init
-        if not self.driver.initialized:
-            driver_name = self.driver.__class__.__name__
-            raise exception.DriverNotInitialized(driver=driver_name)
-        return func(self, *args, **kwargs)
-    return wrapper
+def require_driver_initialized(driver):
+    """Verifies if `driver` is initialized
+
+    If the driver is not initialized, an exception will be raised.
+
+    :params driver: The driver instance.
+    :raises: `exception.DriverNotInitialized`
+    """
+    # we can't do anything if the driver didn't init
+    if not driver.initialized:
+        driver_name = driver.__class__.__name__
+        LOG.error(_LE("Volume driver %s not initialized"), driver_name)
+        raise exception.DriverNotInitialized()
 
 
 def get_file_mode(path):
@@ -832,3 +606,209 @@ def get_file_mode(path):
 def get_file_gid(path):
     """This primarily exists to make unit testing easier."""
     return os.stat(path).st_gid
+
+
+def get_file_size(path):
+    """Returns the file size."""
+    return os.stat(path).st_size
+
+
+def _get_disk_of_partition(devpath, st=None):
+    """Returns a disk device path from a partition device path, and stat for
+    the device. If devpath is not a partition, devpath is returned as it is.
+    For example, '/dev/sda' is returned for '/dev/sda1', and '/dev/disk1' is
+    for '/dev/disk1p1' ('p' is prepended to the partition number if the disk
+    name ends with numbers).
+    """
+    diskpath = re.sub('(?:(?<=\d)p)?\d+$', '', devpath)
+    if diskpath != devpath:
+        try:
+            st_disk = os.stat(diskpath)
+            if stat.S_ISBLK(st_disk.st_mode):
+                return (diskpath, st_disk)
+        except OSError:
+            pass
+    # devpath is not a partition
+    if st is None:
+        st = os.stat(devpath)
+    return (devpath, st)
+
+
+def get_blkdev_major_minor(path, lookup_for_file=True):
+    """Get the device's "major:minor" number of a block device to control
+    I/O ratelimit of the specified path.
+    If lookup_for_file is True and the path is a regular file, lookup a disk
+    device which the file lies on and returns the result for the device.
+    """
+    st = os.stat(path)
+    if stat.S_ISBLK(st.st_mode):
+        path, st = _get_disk_of_partition(path, st)
+        return '%d:%d' % (os.major(st.st_rdev), os.minor(st.st_rdev))
+    elif stat.S_ISCHR(st.st_mode):
+        # No I/O ratelimit control is provided for character devices
+        return None
+    elif lookup_for_file:
+        # lookup the mounted disk which the file lies on
+        out, _err = execute('df', path)
+        devpath = out.split("\n")[1].split()[0]
+        if devpath[0] is not '/':
+            # the file is on a network file system
+            return None
+        return get_blkdev_major_minor(devpath, False)
+    else:
+        msg = _("Unable to get a block device for file \'%s\'") % path
+        raise exception.Error(msg)
+
+
+def check_string_length(value, name, min_length=0, max_length=None):
+    """Check the length of specified string
+    :param value: the value of the string
+    :param name: the name of the string
+    :param min_length: the min_length of the string
+    :param max_length: the max_length of the string
+    """
+    if not isinstance(value, six.string_types):
+        msg = _("%s is not a string or unicode") % name
+        raise exception.InvalidInput(message=msg)
+
+    if len(value) < min_length:
+        msg = _("%(name)s has a minimum character requirement of "
+                "%(min_length)s.") % {'name': name, 'min_length': min_length}
+        raise exception.InvalidInput(message=msg)
+
+    if max_length and len(value) > max_length:
+        msg = _("%(name)s has more than %(max_length)s "
+                "characters.") % {'name': name, 'max_length': max_length}
+        raise exception.InvalidInput(message=msg)
+
+_visible_admin_metadata_keys = ['readonly', 'attached_mode']
+
+
+def add_visible_admin_metadata(volume):
+    """Add user-visible admin metadata to regular metadata.
+
+    Extracts the admin metadata keys that are to be made visible to
+    non-administrators, and adds them to the regular metadata structure for the
+    passed-in volume.
+    """
+    visible_admin_meta = {}
+
+    if volume.get('volume_admin_metadata'):
+        for item in volume['volume_admin_metadata']:
+            if item['key'] in _visible_admin_metadata_keys:
+                visible_admin_meta[item['key']] = item['value']
+    # avoid circular ref when volume is a Volume instance
+    elif (volume.get('admin_metadata') and
+            isinstance(volume.get('admin_metadata'), dict)):
+        for key in _visible_admin_metadata_keys:
+            if key in volume['admin_metadata'].keys():
+                visible_admin_meta[key] = volume['admin_metadata'][key]
+
+    if not visible_admin_meta:
+        return
+
+    # NOTE(zhiyan): update visible administration metadata to
+    # volume metadata, administration metadata will rewrite existing key.
+    if volume.get('volume_metadata'):
+        orig_meta = list(volume.get('volume_metadata'))
+        for item in orig_meta:
+            if item['key'] in visible_admin_meta.keys():
+                item['value'] = visible_admin_meta.pop(item['key'])
+        for key, value in visible_admin_meta.iteritems():
+            orig_meta.append({'key': key, 'value': value})
+        volume['volume_metadata'] = orig_meta
+    # avoid circular ref when vol is a Volume instance
+    elif (volume.get('metadata') and
+            isinstance(volume.get('metadata'), dict)):
+        volume['metadata'].update(visible_admin_meta)
+    else:
+        volume['metadata'] = visible_admin_meta
+
+
+def remove_invalid_filter_options(context, filters,
+                                  allowed_search_options):
+    """Remove search options that are not valid
+    for non-admin API/context.
+    """
+    if context.is_admin:
+        # Allow all options
+        return
+    # Otherwise, strip out all unknown options
+    unknown_options = [opt for opt in filters
+                       if opt not in allowed_search_options]
+    bad_options = ", ".join(unknown_options)
+    LOG.debug("Removing options '%s' from query.", bad_options)
+    for opt in unknown_options:
+        del filters[opt]
+
+
+def is_blk_device(dev):
+    try:
+        if stat.S_ISBLK(os.stat(dev).st_mode):
+            return True
+        return False
+    except Exception:
+        LOG.debug('Path %s not found in is_blk_device check', dev)
+        return False
+
+
+def retry(exceptions, interval=1, retries=3, backoff_rate=2):
+
+    def _retry_on_exception(e):
+        return isinstance(e, exceptions)
+
+    def _backoff_sleep(previous_attempt_number, delay_since_first_attempt_ms):
+        exp = backoff_rate ** previous_attempt_number
+        wait_for = max(0, interval * exp)
+        LOG.debug("Sleeping for %s seconds", wait_for)
+        return wait_for * 1000.0
+
+    def _print_stop(previous_attempt_number, delay_since_first_attempt_ms):
+        delay_since_first_attempt = delay_since_first_attempt_ms / 1000.0
+        LOG.debug("Failed attempt %s", previous_attempt_number)
+        LOG.debug("Have been at this for %s seconds",
+                  delay_since_first_attempt)
+        return previous_attempt_number == retries
+
+    if retries < 1:
+        raise ValueError('Retries must be greater than or '
+                         'equal to 1 (received: %s). ' % retries)
+
+    def _decorator(f):
+
+        @six.wraps(f)
+        def _wrapper(*args, **kwargs):
+            r = retrying.Retrying(retry_on_exception=_retry_on_exception,
+                                  wait_func=_backoff_sleep,
+                                  stop_func=_print_stop)
+            return r.call(f, *args, **kwargs)
+
+        return _wrapper
+
+    return _decorator
+
+
+def convert_version_to_int(version):
+    try:
+        if isinstance(version, six.string_types):
+            version = convert_version_to_tuple(version)
+        if isinstance(version, tuple):
+            return reduce(lambda x, y: (x * 1000) + y, version)
+    except Exception:
+        msg = _("Version %s is invalid.") % version
+        raise exception.CinderException(msg)
+
+
+def convert_version_to_str(version_int):
+    version_numbers = []
+    factor = 1000
+    while version_int != 0:
+        version_number = version_int - (version_int // factor * factor)
+        version_numbers.insert(0, six.text_type(version_number))
+        version_int = version_int / factor
+
+    return reduce(lambda x, y: "%s.%s" % (x, y), version_numbers)
+
+
+def convert_version_to_tuple(version_str):
+    return tuple(int(part) for part in version_str.split('.'))

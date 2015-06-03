@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -23,41 +21,42 @@ inline callbacks.
 
 """
 
-
-import functools
+import logging
 import os
 import shutil
-import tempfile
 import uuid
 
 import fixtures
-import mox
-from oslo.config import cfg
-import stubout
+import mock
+from oslo_concurrency import lockutils
+from oslo_config import cfg
+from oslo_config import fixture as config_fixture
+from oslo_log import log
+from oslo_messaging import conffixture as messaging_conffixture
+from oslo_utils import strutils
+from oslo_utils import timeutils
+from oslotest import moxstubout
 import testtools
-from testtools import matchers
 
-from cinder.common import config  # Need to register global_opts
+from cinder.common import config  # noqa Need to register global_opts
 from cinder.db import migration
-from cinder.openstack.common.db.sqlalchemy import session
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.db.sqlalchemy import api as sqla_api
+from cinder import i18n
+from cinder import objects
+from cinder import rpc
 from cinder import service
-from cinder.tests import conf_fixture
-
+from cinder.tests.unit import conf_fixture
+from cinder.tests.unit import fake_notifier
 
 test_opts = [
     cfg.StrOpt('sqlite_clean_db',
                default='clean.sqlite',
-               help='File name of clean sqlite db'),
-    cfg.BoolOpt('fake_tests',
-                default=True,
-                help='should we use everything for testing'), ]
+               help='File name of clean sqlite db'), ]
 
 CONF = cfg.CONF
 CONF.register_opts(test_opts)
 
-LOG = logging.getLogger(__name__)
+LOG = log.getLogger(__name__)
 
 _DB_CACHE = None
 
@@ -68,30 +67,23 @@ class TestingException(Exception):
 
 class Database(fixtures.Fixture):
 
-    def __init__(self, db_session, db_migrate, sql_connection,
+    def __init__(self, db_api, db_migrate, sql_connection,
                  sqlite_db, sqlite_clean_db):
         self.sql_connection = sql_connection
         self.sqlite_db = sqlite_db
         self.sqlite_clean_db = sqlite_clean_db
 
-        self.engine = db_session.get_engine()
+        self.engine = db_api.get_engine()
         self.engine.dispose()
         conn = self.engine.connect()
-        if sql_connection == "sqlite://":
-            if db_migrate.db_version() > db_migrate.db_initial_version():
-                return
-        else:
-            testdb = os.path.join(CONF.state_path, sqlite_db)
-            if os.path.exists(testdb):
-                return
         db_migrate.db_sync()
-#        self.post_migrations()
         if sql_connection == "sqlite://":
             conn = self.engine.connect()
             self._DB = "".join(line for line in conn.connection.iterdump())
             self.engine.dispose()
         else:
             cleandb = os.path.join(CONF.state_path, sqlite_clean_db)
+            testdb = os.path.join(CONF.state_path, sqlite_db)
             shutil.copyfile(testdb, cleandb)
 
     def setUp(self):
@@ -107,12 +99,41 @@ class Database(fixtures.Fixture):
                 os.path.join(CONF.state_path, self.sqlite_db))
 
 
+def _patch_mock_to_raise_for_invalid_assert_calls():
+    def raise_for_invalid_assert_calls(wrapped):
+        def wrapper(_self, name):
+            valid_asserts = [
+                'assert_called_with',
+                'assert_called_once_with',
+                'assert_has_calls',
+                'assert_any_calls']
+
+            if name.startswith('assert') and name not in valid_asserts:
+                raise AttributeError('%s is not a valid mock assert method'
+                                     % name)
+
+            return wrapped(_self, name)
+        return wrapper
+    mock.Mock.__getattr__ = raise_for_invalid_assert_calls(
+        mock.Mock.__getattr__)
+
+# NOTE(gibi): needs to be called only once at import time
+# to patch the mock lib
+_patch_mock_to_raise_for_invalid_assert_calls()
+
+
 class TestCase(testtools.TestCase):
     """Test case base class for all unit tests."""
 
     def setUp(self):
         """Run before each test method to initialize test environment."""
         super(TestCase, self).setUp()
+
+        # Import cinder objects for test cases
+        objects.register_all()
+
+        # Unit tests do not need to use lazy gettext
+        i18n.enable_lazy(False)
 
         test_timeout = os.environ.get('OS_TEST_TIMEOUT', 0)
         try:
@@ -125,16 +146,33 @@ class TestCase(testtools.TestCase):
         self.useFixture(fixtures.NestedTempfile())
         self.useFixture(fixtures.TempHomeDir())
 
-        if (os.environ.get('OS_STDOUT_CAPTURE') == 'True' or
-                os.environ.get('OS_STDOUT_CAPTURE') == '1'):
+        environ_enabled = (lambda var_name:
+                           strutils.bool_from_string(os.environ.get(var_name)))
+        if environ_enabled('OS_STDOUT_CAPTURE'):
             stdout = self.useFixture(fixtures.StringStream('stdout')).stream
             self.useFixture(fixtures.MonkeyPatch('sys.stdout', stdout))
-        if (os.environ.get('OS_STDERR_CAPTURE') == 'True' or
-                os.environ.get('OS_STDERR_CAPTURE') == '1'):
+        if environ_enabled('OS_STDERR_CAPTURE'):
             stderr = self.useFixture(fixtures.StringStream('stderr')).stream
             self.useFixture(fixtures.MonkeyPatch('sys.stderr', stderr))
+        if environ_enabled('OS_LOG_CAPTURE'):
+            log_format = '%(levelname)s [%(name)s] %(message)s'
+            if environ_enabled('OS_DEBUG'):
+                level = logging.DEBUG
+            else:
+                level = logging.INFO
+            self.useFixture(fixtures.LoggerFixture(nuke_handlers=False,
+                                                   format=log_format,
+                                                   level=level))
 
-        self.log_fixture = self.useFixture(fixtures.FakeLogger())
+        rpc.add_extra_exmods("cinder.tests.unit")
+        self.addCleanup(rpc.clear_extra_exmods)
+        self.addCleanup(rpc.cleanup)
+
+        self.messaging_conf = messaging_conffixture.ConfFixture(CONF)
+        self.messaging_conf.transport_driver = 'fake'
+        self.messaging_conf.response_timeout = 15
+        self.useFixture(self.messaging_conf)
+        rpc.init(CONF)
 
         conf_fixture.set_defaults(CONF)
         CONF([], default_config_files=[])
@@ -145,35 +183,47 @@ class TestCase(testtools.TestCase):
         self.start = timeutils.utcnow()
 
         CONF.set_default('connection', 'sqlite://', 'database')
-        CONF.set_default('sqlite_synchronous', False)
-
-        self.log_fixture = self.useFixture(fixtures.FakeLogger())
+        CONF.set_default('sqlite_synchronous', False, 'database')
 
         global _DB_CACHE
         if not _DB_CACHE:
-            _DB_CACHE = Database(session, migration,
+            _DB_CACHE = Database(sqla_api, migration,
                                  sql_connection=CONF.database.connection,
-                                 sqlite_db=CONF.sqlite_db,
+                                 sqlite_db=CONF.database.sqlite_db,
                                  sqlite_clean_db=CONF.sqlite_clean_db)
         self.useFixture(_DB_CACHE)
 
         # emulate some of the mox stuff, we can't use the metaclass
         # because it screws with our generators
-        self.mox = mox.Mox()
-        self.stubs = stubout.StubOutForTesting()
+        mox_fixture = self.useFixture(moxstubout.MoxStubout())
+        self.mox = mox_fixture.mox
+        self.stubs = mox_fixture.stubs
         self.addCleanup(CONF.reset)
-        self.addCleanup(self.mox.UnsetStubs)
-        self.addCleanup(self.stubs.UnsetAll)
-        self.addCleanup(self.stubs.SmartUnsetAll)
-        self.addCleanup(self.mox.VerifyAll)
+        self.addCleanup(self._common_cleanup)
         self.injected = []
         self._services = []
 
-        CONF.set_override('fatal_exception_format_errors', True)
-        # This will be cleaned up by the NestedTempfile fixture
-        CONF.set_override('lock_path', tempfile.mkdtemp())
+        fake_notifier.stub_notifier(self.stubs)
 
-    def tearDown(self):
+        self.override_config('fatal_exception_format_errors', True)
+        # This will be cleaned up by the NestedTempfile fixture
+        lock_path = self.useFixture(fixtures.TempDir()).path
+        self.fixture = self.useFixture(
+            config_fixture.Config(lockutils.CONF))
+        self.fixture.config(lock_path=lock_path,
+                            group='oslo_concurrency')
+        lockutils.set_defaults(lock_path)
+        self.override_config('policy_file',
+                             os.path.join(
+                                 os.path.abspath(
+                                     os.path.join(
+                                         os.path.dirname(__file__),
+                                         '..',
+                                     )
+                                 ),
+                                 'cinder/tests/unit/policy.json'))
+
+    def _common_cleanup(self):
         """Runs after each test method to tear down test environment."""
 
         # Stop any timers
@@ -195,12 +245,21 @@ class TestCase(testtools.TestCase):
         # suite
         for key in [k for k in self.__dict__.keys() if k[0] != '_']:
             del self.__dict__[key]
-        super(TestCase, self).tearDown()
+
+    def override_config(self, name, override, group=None):
+        """Cleanly override CONF variables."""
+        CONF.set_override(name, override, group)
+        self.addCleanup(CONF.clear_override, name, group)
 
     def flags(self, **kw):
         """Override CONF variables for a test."""
         for k, v in kw.iteritems():
-            CONF.set_override(k, v)
+            self.override_config(k, v)
+
+    def log_level(self, level):
+        """Set logging level to the specified value."""
+        log_root = logging.getLogger(None).logger
+        log_root.setLevel(level)
 
     def start_service(self, name, host=None, **kwargs):
         host = host and host or uuid.uuid4().hex
@@ -210,6 +269,20 @@ class TestCase(testtools.TestCase):
         svc.start()
         self._services.append(svc)
         return svc
+
+    def mock_object(self, obj, attr_name, new_attr=None, **kwargs):
+        """Use python mock to mock an object attribute
+
+        Mocks the specified objects attribute with the given value.
+        Automatically performs 'addCleanup' for the mock.
+
+        """
+        if not new_attr:
+            new_attr = mock.Mock()
+        patcher = mock.patch.object(obj, attr_name, new_attr, **kwargs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return new_attr
 
     # Useful assertions
     def assertDictMatch(self, d1, d2, approx_equal=False, tolerance=0.001):
@@ -226,8 +299,8 @@ class TestCase(testtools.TestCase):
 
         """
         def raise_assertion(msg):
-            d1str = str(d1)
-            d2str = str(d2)
+            d1str = d1
+            d2str = d2
             base_msg = ('Dictionaries do not match. %(msg)s d1: %(d1str)s '
                         'd2: %(d2str)s' %
                         {'msg': msg, 'd1str': d1str, 'd2str': d2str})
@@ -249,7 +322,7 @@ class TestCase(testtools.TestCase):
                 error = abs(float(d1value) - float(d2value))
                 within_tolerance = error <= tolerance
             except (ValueError, TypeError):
-                # If both values aren't convertable to float, just ignore
+                # If both values aren't convertible to float, just ignore
                 # ValueError if arg is a str, TypeError if it's something else
                 # (like None)
                 within_tolerance = False
@@ -268,25 +341,3 @@ class TestCase(testtools.TestCase):
                                     'd1value': d1value,
                                     'd2value': d2value,
                                 })
-
-    def assertGreater(self, first, second, msg=None):
-        """Python < v2.7 compatibility.  Assert 'first' > 'second'"""
-        try:
-            f = super(TestCase, self).assertGreater
-        except AttributeError:
-            self.assertThat(first,
-                            matchers.GreaterThan(second),
-                            message=msg or '')
-        else:
-            f(first, second, msg=msg)
-
-    def assertGreaterEqual(self, first, second, msg=None):
-        """Python < v2.7 compatibility.  Assert 'first' >= 'second'"""
-        try:
-            f = super(TestCase, self).assertGreaterEqual
-        except AttributeError:
-            self.assertThat(first,
-                            matchers.Not(matchers.LessThan(second)),
-                            message=msg or '')
-        else:
-            f(first, second, msg=msg)

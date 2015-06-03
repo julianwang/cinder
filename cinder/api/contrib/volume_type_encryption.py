@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 The Johns Hopkins University/Applied Physics Laboratory
 # All Rights Reserved.
 #
@@ -24,7 +22,8 @@ from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
-from cinder.openstack.common.notifier import api as notifier_api
+from cinder.i18n import _
+from cinder import rpc
 from cinder.volume import volume_types
 
 authorize = extensions.extension_authorizer('volume',
@@ -109,6 +108,10 @@ class VolumeTypeEncryptionController(wsgi.Controller):
         context = req.environ['cinder.context']
         authorize(context)
 
+        if self._encrypted_type_in_use(context, type_id):
+            expl = _('Cannot create encryption specs. Volume type in use.')
+            raise webob.exc.HTTPBadRequest(explanation=expl)
+
         if not self.is_valid_body(body, 'encryption'):
             expl = _('Create body is not valid.')
             raise webob.exc.HTTPBadRequest(explanation=expl)
@@ -123,12 +126,42 @@ class VolumeTypeEncryptionController(wsgi.Controller):
 
         self._check_encryption_input(encryption_specs)
 
-        db.volume_type_encryption_update_or_create(context, type_id,
-                                                   encryption_specs)
+        db.volume_type_encryption_create(context, type_id, encryption_specs)
         notifier_info = dict(type_id=type_id, specs=encryption_specs)
-        notifier_api.notify(context, 'volumeTypeEncryption',
-                            'volume_type_encryption.create',
-                            notifier_api.INFO, notifier_info)
+        notifier = rpc.get_notifier('volumeTypeEncryption')
+        notifier.info(context, 'volume_type_encryption.create', notifier_info)
+        return body
+
+    @wsgi.serializers(xml=VolumeTypeEncryptionTemplate)
+    def update(self, req, type_id, id, body=None):
+        """Update encryption specs for a given volume type."""
+        context = req.environ['cinder.context']
+        authorize(context)
+
+        if not body:
+            expl = _('Request body empty.')
+            raise webob.exc.HTTPBadRequest(explanation=expl)
+        if not self.is_valid_body(body, 'encryption'):
+            expl = _('Update body is not valid. It must contain "encryption."')
+            raise webob.exc.HTTPBadRequest(explanation=expl)
+        if len(body) > 1:
+            expl = _('Request body contains too many items.')
+            raise webob.exc.HTTPBadRequest(explanation=expl)
+
+        self._check_type(context, type_id)
+
+        if self._encrypted_type_in_use(context, type_id):
+            expl = _('Cannot update encryption specs. Volume type in use.')
+            raise webob.exc.HTTPBadRequest(explanation=expl)
+
+        encryption_specs = body['encryption']
+        self._check_encryption_input(encryption_specs, create=False)
+
+        db.volume_type_encryption_update(context, type_id, encryption_specs)
+        notifier_info = dict(type_id=type_id, id=id)
+        notifier = rpc.get_notifier('volumeTypeEncryption')
+        notifier.info(context, 'volume_type_encryption.update', notifier_info)
+
         return body
 
     @wsgi.serializers(xml=VolumeTypeEncryptionTemplate)

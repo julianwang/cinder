@@ -16,6 +16,8 @@
 
 import logging
 
+import six
+
 from cinder.api import extensions
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
@@ -39,7 +41,7 @@ class VolumeImageMetadataController(wsgi.Controller):
             all_metadata = self.volume_api.get_volumes_image_metadata(context)
         except Exception as e:
             LOG.debug('Problem retrieving volume image metadata. '
-                      'It will be skipped. Error: %s', e)
+                      'It will be skipped. Error: %s', six.text_type(e))
             all_metadata = {}
         return all_metadata
 
@@ -76,13 +78,13 @@ class VolumeImageMetadataController(wsgi.Controller):
         if authorize(context):
             resp_obj.attach(xml=VolumesImageMetadataTemplate())
             all_meta = self._get_all_images_metadata(context)
-            for volume in list(resp_obj.obj.get('volumes', [])):
-                image_meta = all_meta.get(volume['id'], {})
-                self._add_image_metadata(context, volume, image_meta)
+            for vol in list(resp_obj.obj.get('volumes', [])):
+                image_meta = all_meta.get(vol['id'], {})
+                self._add_image_metadata(context, vol, image_meta)
 
 
 class Volume_image_metadata(extensions.ExtensionDescriptor):
-    """Show image metadata associated with the volume"""
+    """Show image metadata associated with the volume."""
 
     name = "VolumeImageMetadata"
     alias = "os-vol-image-meta"

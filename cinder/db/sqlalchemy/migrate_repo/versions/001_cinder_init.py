@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,20 +12,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-
+from oslo_log import log as logging
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey
 from sqlalchemy import Integer, MetaData, String, Table
 
-from cinder.openstack.common import log as logging
+from cinder.i18n import _LE, _LI
 
 
 LOG = logging.getLogger(__name__)
 
 
-def upgrade(migrate_engine):
-    meta = MetaData()
-    meta.bind = migrate_engine
-
+def define_tables(meta):
     migrations = Table(
         'migrations', meta,
         Column('created_at', DateTime),
@@ -218,28 +213,34 @@ def upgrade(migrate_engine):
                nullable=True),
         mysql_engine='InnoDB'
     )
+    return [sm_flavors,
+            sm_backend_config,
+            snapshots,
+            volume_types,
+            volumes,
+            iscsi_targets,
+            migrations,
+            quotas,
+            services,
+            sm_volume,
+            volume_metadata,
+            volume_type_extra_specs]
+
+
+def upgrade(migrate_engine):
+    meta = MetaData()
+    meta.bind = migrate_engine
 
     # create all tables
     # Take care on create order for those with FK dependencies
-    tables = [sm_flavors,
-              sm_backend_config,
-              snapshots,
-              volume_types,
-              volumes,
-              iscsi_targets,
-              migrations,
-              quotas,
-              services,
-              sm_volume,
-              volume_metadata,
-              volume_type_extra_specs]
+    tables = define_tables(meta)
 
     for table in tables:
         try:
             table.create()
         except Exception:
             LOG.info(repr(table))
-            LOG.exception(_('Exception while creating table.'))
+            LOG.exception(_LE('Exception while creating table.'))
             raise
 
     if migrate_engine.name == "mysql":
@@ -257,15 +258,22 @@ def upgrade(migrate_engine):
                   "volume_metadata",
                   "volume_type_extra_specs"]
 
-        sql = "SET foreign_key_checks = 0;"
+        migrate_engine.execute("SET foreign_key_checks = 0")
         for table in tables:
-            sql += "ALTER TABLE %s CONVERT TO CHARACTER SET utf8;" % table
-        sql += "SET foreign_key_checks = 1;"
-        sql += "ALTER DATABASE %s DEFAULT CHARACTER SET utf8;" \
-            % migrate_engine.url.database
-        sql += "ALTER TABLE %s Engine=InnoDB;" % table
-        migrate_engine.execute(sql)
+            migrate_engine.execute(
+                "ALTER TABLE %s CONVERT TO CHARACTER SET utf8" % table)
+        migrate_engine.execute("SET foreign_key_checks = 1")
+        migrate_engine.execute(
+            "ALTER DATABASE %s DEFAULT CHARACTER SET utf8" %
+            migrate_engine.url.database)
+        migrate_engine.execute("ALTER TABLE %s Engine=InnoDB" % table)
 
 
 def downgrade(migrate_engine):
-    LOG.exception(_('Downgrade from initial Cinder install is unsupported.'))
+    meta = MetaData()
+    meta.bind = migrate_engine
+    tables = define_tables(meta)
+    tables.reverse()
+    for table in tables:
+        LOG.info(_LI("dropping table %(table)s"), {'table': table})
+        table.drop()

@@ -18,17 +18,17 @@
 SheepDog Volume Driver.
 
 """
-import os
 import re
-import tempfile
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import units
 
 from cinder import exception
+from cinder.i18n import _, _LE
 from cinder.image import image_utils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
-from cinder import units
+from cinder.openstack.common import fileutils
 from cinder.volume import driver
 
 
@@ -39,7 +39,7 @@ CONF.import_opt("image_conversion_dir", "cinder.image.image_utils")
 
 
 class SheepdogDriver(driver.VolumeDriver):
-    """Executes commands relating to Sheepdog Volumes"""
+    """Executes commands relating to Sheepdog Volumes."""
 
     VERSION = "1.0.0"
 
@@ -49,12 +49,12 @@ class SheepdogDriver(driver.VolumeDriver):
         self._stats = {}
 
     def check_for_setup_error(self):
-        """Returns an error if prerequisites aren't met"""
+        """Return error if prerequisites aren't met."""
         try:
-            #NOTE(francois-charlier) Since 0.24 'collie cluster info -r'
-            #  gives short output, but for compatibility reason we won't
-            #  use it and just check if 'running' is in the output.
-            (out, err) = self._execute('collie', 'cluster', 'info')
+            # NOTE(francois-charlier) Since 0.24 'collie cluster info -r'
+            # gives short output, but for compatibility reason we won't
+            # use it and just check if 'running' is in the output.
+            (out, _err) = self._execute('collie', 'cluster', 'info')
             if 'status: running' not in out:
                 exception_message = (_("Sheepdog is not working: %s") % out)
                 raise exception.VolumeBackendAPIException(
@@ -64,33 +64,102 @@ class SheepdogDriver(driver.VolumeDriver):
             exception_message = _("Sheepdog is not working")
             raise exception.VolumeBackendAPIException(data=exception_message)
 
+    def _is_cloneable(self, image_location, image_meta):
+        """Check the image can be clone or not."""
+
+        if image_location is None:
+            return False
+
+        if not image_location.startswith("sheepdog:"):
+            LOG.debug("Image is not stored in sheepdog.")
+            return False
+
+        if image_meta['disk_format'] != 'raw':
+            LOG.debug("Image clone requires image format to be "
+                      "'raw' but image %s(%s) is '%s'.",
+                      image_location,
+                      image_meta['id'],
+                      image_meta['disk_format'])
+            return False
+
+        cloneable = False
+        # check whether volume is stored in sheepdog
+        try:
+            # The image location would be like
+            # "sheepdog:192.168.10.2:7000:Alice"
+            (label, ip, port, name) = image_location.split(":", 3)
+
+            self._try_execute('collie', 'vdi', 'list', '--address', ip,
+                              '--port', port, name)
+            cloneable = True
+        except processutils.ProcessExecutionError as e:
+            LOG.debug("Can not find vdi %(image)s: %(err)s",
+                      {'image': name, 'err': e})
+
+        return cloneable
+
+    def clone_image(self, context, volume,
+                    image_location, image_meta,
+                    image_service):
+        """Create a volume efficiently from an existing image."""
+        image_location = image_location[0] if image_location else None
+        if not self._is_cloneable(image_location, image_meta):
+            return {}, False
+
+        # The image location would be like
+        # "sheepdog:192.168.10.2:7000:Alice"
+        (label, ip, port, name) = image_location.split(":", 3)
+        volume_ref = {'name': name, 'size': image_meta['size']}
+        self.create_cloned_volume(volume, volume_ref)
+        self._resize(volume)
+
+        vol_path = self.local_path(volume)
+        return {'provider_location': vol_path}, True
+
     def create_cloned_volume(self, volume, src_vref):
-        raise NotImplementedError()
+        """Clone a sheepdog volume from another volume."""
+
+        snapshot_name = src_vref['name'] + '-temp-snapshot'
+        snapshot = {
+            'name': snapshot_name,
+            'volume_name': src_vref['name'],
+            'volume_size': src_vref['size'],
+        }
+
+        self.create_snapshot(snapshot)
+
+        try:
+            # Create volume
+            self.create_volume_from_snapshot(volume, snapshot)
+        except processutils.ProcessExecutionError:
+            msg = _('Failed to create cloned volume %s.') % volume['id']
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(msg)
+        finally:
+            # Delete temp Snapshot
+            self.delete_snapshot(snapshot)
 
     def create_volume(self, volume):
-        """Creates a sheepdog volume"""
+        """Create a sheepdog volume."""
         self._try_execute('qemu-img', 'create',
                           "sheepdog:%s" % volume['name'],
                           '%sG' % volume['size'])
 
     def create_volume_from_snapshot(self, volume, snapshot):
-        """Creates a sheepdog volume from a snapshot."""
+        """Create a sheepdog volume from a snapshot."""
         self._try_execute('qemu-img', 'create', '-b',
                           "sheepdog:%s:%s" % (snapshot['volume_name'],
                                               snapshot['name']),
-                          "sheepdog:%s" % volume['name'])
+                          "sheepdog:%s" % volume['name'],
+                          '%sG' % volume['size'])
 
     def delete_volume(self, volume):
-        """Deletes a logical volume"""
+        """Delete a logical volume."""
         self._delete(volume)
-
-    def _ensure_dir_exists(self, tmp_dir):
-        if tmp_dir and not os.path.exists(tmp_dir):
-            os.makedirs(tmp_dir)
 
     def _resize(self, volume, size=None):
         if not size:
-            size = int(volume['size']) * units.GiB
+            size = int(volume['size']) * units.Gi
 
         self._try_execute('collie', 'vdi', 'resize',
                           volume['name'], size)
@@ -100,13 +169,10 @@ class SheepdogDriver(driver.VolumeDriver):
                           volume['name'])
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
-        # use the image_conversion_dir as a temporary place to save the image
-        conversion_dir = CONF.image_conversion_dir
-        self._ensure_dir_exists(conversion_dir)
-        with tempfile.NamedTemporaryFile(dir=conversion_dir) as tmp:
+        with image_utils.temporary_file() as tmp:
             # (wenhao): we don't need to convert to raw for sheepdog.
             image_utils.fetch_verify_image(context, image_service,
-                                           image_id, tmp.name)
+                                           image_id, tmp)
 
             # remove the image created by import before this function.
             # see volume/drivers/manager.py:_create_volume
@@ -116,13 +182,32 @@ class SheepdogDriver(driver.VolumeDriver):
                                       'raw')
             self._resize(volume)
 
+    def copy_volume_to_image(self, context, volume, image_service, image_meta):
+        """Copy the volume to the specified image."""
+        image_id = image_meta['id']
+        with image_utils.temporary_file() as tmp:
+            # image_utils.convert_image doesn't support "sheepdog:" source,
+            # so we use the qemu-img directly.
+            # Sheepdog volume is always raw-formatted.
+            cmd = ('qemu-img',
+                   'convert',
+                   '-f', 'raw',
+                   '-t', 'none',
+                   '-O', 'raw',
+                   'sheepdog:%s' % volume['name'],
+                   tmp)
+            self._try_execute(*cmd)
+
+            with fileutils.file_open(tmp, 'rb') as image_file:
+                image_service.update(context, image_id, {}, image_file)
+
     def create_snapshot(self, snapshot):
-        """Creates a sheepdog snapshot"""
+        """Create a sheepdog snapshot."""
         self._try_execute('qemu-img', 'snapshot', '-c', snapshot['name'],
                           "sheepdog:%s" % snapshot['volume_name'])
 
     def delete_snapshot(self, snapshot):
-        """Deletes a sheepdog snapshot"""
+        """Delete a sheepdog snapshot."""
         self._try_execute('collie', 'vdi', 'delete', snapshot['volume_name'],
                           '-s', snapshot['name'])
 
@@ -130,15 +215,15 @@ class SheepdogDriver(driver.VolumeDriver):
         return "sheepdog:%s" % volume['name']
 
     def ensure_export(self, context, volume):
-        """Safely and synchronously recreates an export for a logical volume"""
+        """Safely and synchronously recreate an export for a logical volume."""
         pass
 
     def create_export(self, context, volume):
-        """Exports the volume"""
+        """Export a volume."""
         pass
 
     def remove_export(self, context, volume):
-        """Removes an export for a logical volume"""
+        """Remove an export for a logical volume."""
         pass
 
     def initialize_connection(self, volume, connector):
@@ -172,10 +257,10 @@ class SheepdogDriver(driver.VolumeDriver):
             m = self.stats_pattern.match(stdout)
             total = float(m.group(1))
             used = float(m.group(2))
-            stats['total_capacity_gb'] = total / units.GiB
-            stats['free_capacity_gb'] = (total - used) / units.GiB
+            stats['total_capacity_gb'] = total / units.Gi
+            stats['free_capacity_gb'] = (total - used) / units.Gi
         except processutils.ProcessExecutionError:
-            LOG.exception(_('error refreshing volume stats'))
+            LOG.exception(_LE('error refreshing volume stats'))
 
         self._stats = stats
 
@@ -189,7 +274,7 @@ class SheepdogDriver(driver.VolumeDriver):
         old_size = volume['size']
 
         try:
-            size = int(new_size) * units.GiB
+            size = int(new_size) * units.Gi
             self._resize(volume, size=size)
         except Exception:
             msg = _('Failed to Extend Volume '
@@ -197,7 +282,7 @@ class SheepdogDriver(driver.VolumeDriver):
             LOG.error(msg)
             raise exception.VolumeBackendAPIException(data=msg)
 
-        LOG.debug(_("Extend volume from %(old_size)s GB to %(new_size)s GB."),
+        LOG.debug("Extend volume from %(old_size)s GB to %(new_size)s GB.",
                   {'old_size': old_size, 'new_size': new_size})
 
     def backup_volume(self, context, backup, backup_service):

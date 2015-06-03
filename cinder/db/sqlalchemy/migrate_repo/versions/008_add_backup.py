@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
 # All Rights Reserved.
 #
@@ -15,10 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 from sqlalchemy import Boolean, Column, DateTime
 from sqlalchemy import MetaData, Integer, String, Table
 
-from cinder.openstack.common import log as logging
+from cinder.i18n import _LE
 
 LOG = logging.getLogger(__name__)
 
@@ -55,7 +54,7 @@ def upgrade(migrate_engine):
     try:
         backups.create()
     except Exception:
-        LOG.error(_("Table |%s| not created!"), repr(backups))
+        LOG.error(_LE("Table |%s| not created!"), repr(backups))
         raise
 
 
@@ -67,5 +66,5 @@ def downgrade(migrate_engine):
     try:
         backups.drop()
     except Exception:
-        LOG.error(_("backups table not dropped"))
+        LOG.error(_LE("backups table not dropped"))
         raise

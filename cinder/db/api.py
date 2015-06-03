@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -19,8 +17,6 @@
 
 """Defines interface for DB access.
 
-The underlying driver is loaded as a :class:`LazyPluggable`.
-
 Functions in this module are imported into the cinder.db namespace. Call these
 functions from cinder.db namespace, not the cinder.db.api namespace.
 
@@ -32,9 +28,6 @@ these objects be simple dictionaries.
 
 **Related Flags**
 
-:backend:  string to lookup in the list of LazyPluggable backends.
-           `sqlalchemy` is the only supported backend right now.
-
 :connection:  string specifying the sqlalchemy connection to use, like:
               `sqlite:///var/lib/cinder/cinder.sqlite`.
 
@@ -43,21 +36,12 @@ these objects be simple dictionaries.
 
 """
 
-from oslo.config import cfg
-
-from cinder import exception
-from cinder.openstack.common.db import api as db_api
+from oslo_config import cfg
+from oslo_db import concurrency as db_concurrency
+from oslo_db import options as db_options
 
 
 db_opts = [
-    # TODO(rpodolyaka): this option is deprecated but still passed to
-    #                   LazyPluggable class which doesn't support retrieving
-    #                   of options put into groups. Nova's version of this
-    #                   class supports this. Perhaps, we should put it to Oslo
-    #                   and then reuse here.
-    cfg.StrOpt('db_backend',
-               default='sqlalchemy',
-               help='The backend to use for db'),
     cfg.BoolOpt('enable_new_services',
                 default=True,
                 help='Services to be added to the available pool on create'),
@@ -71,17 +55,32 @@ db_opts = [
                default='backup-%s',
                help='Template string to be used to generate backup names'), ]
 
+
 CONF = cfg.CONF
 CONF.register_opts(db_opts)
+db_options.set_defaults(CONF)
+CONF.set_default('sqlite_db', 'cinder.sqlite', group='database')
 
 _BACKEND_MAPPING = {'sqlalchemy': 'cinder.db.sqlalchemy.api'}
 
-IMPL = db_api.DBAPI(backend_mapping=_BACKEND_MAPPING)
+
+IMPL = db_concurrency.TpoolDbapiWrapper(CONF, _BACKEND_MAPPING)
 
 
-class NoMoreTargets(exception.CinderException):
-    """No more available targets"""
-    pass
+###################
+
+def dispose_engine():
+    """Force the engine to establish new connections."""
+
+    # FIXME(jdg): When using sqlite if we do the dispose
+    # we seem to lose our DB here.  Adding this check
+    # means we don't do the dispose, but we keep our sqlite DB
+    # This likely isn't the best way to handle this
+
+    if 'sqlite' not in IMPL.get_engine().name:
+        return IMPL.dispose_engine()
+    else:
+        return
 
 
 ###################
@@ -107,23 +106,9 @@ def service_get_all(context, disabled=None):
     return IMPL.service_get_all(context, disabled)
 
 
-def service_get_all_by_topic(context, topic):
+def service_get_all_by_topic(context, topic, disabled=None):
     """Get all services for a given topic."""
-    return IMPL.service_get_all_by_topic(context, topic)
-
-
-def service_get_all_by_host(context, host):
-    """Get all services for a given host."""
-    return IMPL.service_get_all_by_host(context, host)
-
-
-def service_get_all_volume_sorted(context):
-    """Get all volume services sorted by volume count.
-
-    :returns: a list of (Service, volume_count) tuples.
-
-    """
-    return IMPL.service_get_all_volume_sorted(context)
+    return IMPL.service_get_all_by_topic(context, topic, disabled=disabled)
 
 
 def service_get_by_args(context, host, binary):
@@ -166,15 +151,17 @@ def iscsi_target_create_safe(context, values):
 
 ###############
 
-def volume_allocate_iscsi_target(context, volume_id, host):
-    """Atomically allocate a free iscsi_target from the pool."""
-    return IMPL.volume_allocate_iscsi_target(context, volume_id, host)
+
+def volume_attach(context, values):
+    """Attach a volume."""
+    return IMPL.volume_attach(context, values)
 
 
-def volume_attached(context, volume_id, instance_id, host_name, mountpoint):
+def volume_attached(context, volume_id, instance_id, host_name, mountpoint,
+                    attach_mode='rw'):
     """Ensure that a volume is set as attached."""
     return IMPL.volume_attached(context, volume_id, instance_id, host_name,
-                                mountpoint)
+                                mountpoint, attach_mode)
 
 
 def volume_create(context, values):
@@ -182,10 +169,11 @@ def volume_create(context, values):
     return IMPL.volume_create(context, values)
 
 
-def volume_data_get_for_host(context, host):
+def volume_data_get_for_host(context, host, count_only=False):
     """Get (volume_count, gigabytes) for project."""
     return IMPL.volume_data_get_for_host(context,
-                                         host)
+                                         host,
+                                         count_only)
 
 
 def volume_data_get_for_project(context, project_id):
@@ -203,9 +191,9 @@ def volume_destroy(context, volume_id):
     return IMPL.volume_destroy(context, volume_id)
 
 
-def volume_detached(context, volume_id):
+def volume_detached(context, volume_id, attachment_id):
     """Ensure that a volume is set as detached."""
-    return IMPL.volume_detached(context, volume_id)
+    return IMPL.volume_detached(context, volume_id, attachment_id)
 
 
 def volume_get(context, volume_id):
@@ -213,26 +201,30 @@ def volume_get(context, volume_id):
     return IMPL.volume_get(context, volume_id)
 
 
-def volume_get_all(context, marker, limit, sort_key, sort_dir):
+def volume_get_all(context, marker, limit, sort_keys=None, sort_dirs=None,
+                   filters=None):
     """Get all volumes."""
-    return IMPL.volume_get_all(context, marker, limit, sort_key, sort_dir)
+    return IMPL.volume_get_all(context, marker, limit, sort_keys=sort_keys,
+                               sort_dirs=sort_dirs, filters=filters)
 
 
-def volume_get_all_by_host(context, host):
+def volume_get_all_by_host(context, host, filters=None):
     """Get all volumes belonging to a host."""
-    return IMPL.volume_get_all_by_host(context, host)
+    return IMPL.volume_get_all_by_host(context, host, filters=filters)
 
 
-def volume_get_all_by_instance_uuid(context, instance_uuid):
-    """Get all volumes belonging to a instance."""
-    return IMPL.volume_get_all_by_instance_uuid(context, instance_uuid)
+def volume_get_all_by_group(context, group_id, filters=None):
+    """Get all volumes belonging to a consistency group."""
+    return IMPL.volume_get_all_by_group(context, group_id, filters=filters)
 
 
-def volume_get_all_by_project(context, project_id, marker, limit, sort_key,
-                              sort_dir):
+def volume_get_all_by_project(context, project_id, marker, limit,
+                              sort_keys=None, sort_dirs=None, filters=None):
     """Get all volumes belonging to a project."""
     return IMPL.volume_get_all_by_project(context, project_id, marker, limit,
-                                          sort_key, sort_dir)
+                                          sort_keys=sort_keys,
+                                          sort_dirs=sort_dirs,
+                                          filters=filters)
 
 
 def volume_get_iscsi_target_num(context, volume_id):
@@ -247,6 +239,32 @@ def volume_update(context, volume_id, values):
 
     """
     return IMPL.volume_update(context, volume_id, values)
+
+
+def volume_attachment_update(context, attachment_id, values):
+    return IMPL.volume_attachment_update(context, attachment_id, values)
+
+
+def volume_attachment_get(context, attachment_id, session=None):
+    return IMPL.volume_attachment_get(context, attachment_id, session)
+
+
+def volume_attachment_get_used_by_volume_id(context, volume_id):
+    return IMPL.volume_attachment_get_used_by_volume_id(context, volume_id)
+
+
+def volume_attachment_get_by_host(context, volume_id, host):
+    return IMPL.volume_attachment_get_by_host(context, volume_id, host)
+
+
+def volume_attachment_get_by_instance_uuid(context, volume_id, instance_uuid):
+    return IMPL.volume_attachment_get_by_instance_uuid(context, volume_id,
+                                                       instance_uuid)
+
+
+def volume_update_status_based_on_attachment(context, volume_id):
+    """Update volume status according to attached instance id"""
+    return IMPL.volume_update_status_based_on_attachment(context, volume_id)
 
 
 ####################
@@ -275,6 +293,20 @@ def snapshot_get_all(context):
 def snapshot_get_all_by_project(context, project_id):
     """Get all snapshots belonging to a project."""
     return IMPL.snapshot_get_all_by_project(context, project_id)
+
+
+def snapshot_get_by_host(context, host, filters=None):
+    """Get all snapshots belonging to a host.
+
+    :param host: Include include snapshots only for specified host.
+    :param filters: Filters for the query in the form of key/value.
+    """
+    return IMPL.snapshot_get_by_host(context, host, filters)
+
+
+def snapshot_get_all_for_cgsnapshot(context, project_id):
+    """Get all snapshots belonging to a cgsnapshot."""
+    return IMPL.snapshot_get_all_for_cgsnapshot(context, project_id)
 
 
 def snapshot_get_all_for_volume(context, volume_id):
@@ -316,7 +348,7 @@ def snapshot_metadata_get(context, snapshot_id):
 
 def snapshot_metadata_delete(context, snapshot_id, key):
     """Delete the given metadata item."""
-    IMPL.snapshot_metadata_delete(context, snapshot_id, key)
+    return IMPL.snapshot_metadata_delete(context, snapshot_id, key)
 
 
 def snapshot_metadata_update(context, snapshot_id, metadata, delete):
@@ -335,7 +367,7 @@ def volume_metadata_get(context, volume_id):
 
 def volume_metadata_delete(context, volume_id, key):
     """Delete the given metadata item."""
-    IMPL.volume_metadata_delete(context, volume_id, key)
+    return IMPL.volume_metadata_delete(context, volume_id, key)
 
 
 def volume_metadata_update(context, volume_id, metadata, delete):
@@ -353,35 +385,67 @@ def volume_admin_metadata_get(context, volume_id):
 
 def volume_admin_metadata_delete(context, volume_id, key):
     """Delete the given metadata item."""
-    IMPL.volume_admin_metadata_delete(context, volume_id, key)
+    return IMPL.volume_admin_metadata_delete(context, volume_id, key)
 
 
 def volume_admin_metadata_update(context, volume_id, metadata, delete):
     """Update metadata if it exists, otherwise create it."""
-    IMPL.volume_admin_metadata_update(context, volume_id, metadata, delete)
+    return IMPL.volume_admin_metadata_update(context, volume_id, metadata,
+                                             delete)
 
 
 ##################
 
 
-def volume_type_create(context, values):
+def volume_type_create(context, values, projects=None):
     """Create a new volume type."""
-    return IMPL.volume_type_create(context, values)
+    return IMPL.volume_type_create(context, values, projects)
 
 
-def volume_type_get_all(context, inactive=False):
-    """Get all volume types."""
-    return IMPL.volume_type_get_all(context, inactive)
+def volume_type_update(context, volume_type_id, values):
+    return IMPL.volume_type_update(context, volume_type_id, values)
 
 
-def volume_type_get(context, id, inactive=False):
-    """Get volume type by id."""
-    return IMPL.volume_type_get(context, id, inactive)
+def volume_type_get_all(context, inactive=False, filters=None):
+    """Get all volume types.
+
+    :param context: context to query under
+    :param inactive: Include inactive volume types to the result set
+    :param filters: Filters for the query in the form of key/value.
+
+        :is_public: Filter volume types based on visibility:
+
+            * **True**: List public volume types only
+            * **False**: List private volume types only
+            * **None**: List both public and private volume types
+
+    :returns: list of matching volume types
+    """
+
+    return IMPL.volume_type_get_all(context, inactive, filters)
+
+
+def volume_type_get(context, id, inactive=False, expected_fields=None):
+    """Get volume type by id.
+
+    :param context: context to query under
+    :param id: Volume type id to get.
+    :param inactive: Consider inactive volume types when searching
+    :param expected_fields: Return those additional fields.
+                            Supported fields are: projects.
+    :returns: volume type
+    """
+    return IMPL.volume_type_get(context, id, inactive, expected_fields)
 
 
 def volume_type_get_by_name(context, name):
     """Get volume type by name."""
     return IMPL.volume_type_get_by_name(context, name)
+
+
+def volume_types_get_by_name_or_id(context, volume_type_list):
+    """Get volume types by name or id."""
+    return IMPL.volume_types_get_by_name_or_id(context, volume_type_list)
 
 
 def volume_type_qos_associations_get(context, qos_specs_id, inactive=False):
@@ -425,6 +489,21 @@ def volume_get_active_by_window(context, begin, end=None, project_id=None):
     return IMPL.volume_get_active_by_window(context, begin, end, project_id)
 
 
+def volume_type_access_get_all(context, type_id):
+    """Get all volume type access of a volume type."""
+    return IMPL.volume_type_access_get_all(context, type_id)
+
+
+def volume_type_access_add(context, type_id, project_id):
+    """Add volume type access for project."""
+    return IMPL.volume_type_access_add(context, type_id, project_id)
+
+
+def volume_type_access_remove(context, type_id, project_id):
+    """Remove volume type access for project."""
+    return IMPL.volume_type_access_remove(context, type_id, project_id)
+
+
 ####################
 
 
@@ -435,7 +514,7 @@ def volume_type_extra_specs_get(context, volume_type_id):
 
 def volume_type_extra_specs_delete(context, volume_type_id, key):
     """Delete the given extra specs item."""
-    IMPL.volume_type_extra_specs_delete(context, volume_type_id, key)
+    return IMPL.volume_type_extra_specs_delete(context, volume_type_id, key)
 
 
 def volume_type_extra_specs_update_or_create(context,
@@ -444,9 +523,9 @@ def volume_type_extra_specs_update_or_create(context,
     """Create or update volume type extra specs. This adds or modifies the
     key/value pairs specified in the extra specs dict argument
     """
-    IMPL.volume_type_extra_specs_update_or_create(context,
-                                                  volume_type_id,
-                                                  extra_specs)
+    return IMPL.volume_type_extra_specs_update_or_create(context,
+                                                         volume_type_id,
+                                                         extra_specs)
 
 
 ###################
@@ -460,12 +539,14 @@ def volume_type_encryption_delete(context, volume_type_id):
     return IMPL.volume_type_encryption_delete(context, volume_type_id)
 
 
-# TODO(joel-coffman): split into two functions -- update and create
-def volume_type_encryption_update_or_create(context, volume_type_id,
-                                            encryption_specs):
-    return IMPL.volume_type_encryption_update_or_create(context,
-                                                        volume_type_id,
-                                                        encryption_specs)
+def volume_type_encryption_create(context, volume_type_id, encryption_specs):
+    return IMPL.volume_type_encryption_create(context, volume_type_id,
+                                              encryption_specs)
+
+
+def volume_type_encryption_update(context, volume_type_id, encryption_specs):
+    return IMPL.volume_type_encryption_update(context, volume_type_id,
+                                              encryption_specs)
 
 
 def volume_type_encryption_volume_get(context, volume_type_id, session=None):
@@ -522,12 +603,12 @@ def qos_specs_disassociate_all(context, qos_specs_id):
 
 def qos_specs_delete(context, qos_specs_id):
     """Delete the qos_specs."""
-    IMPL.qos_specs_delete(context, qos_specs_id)
+    return IMPL.qos_specs_delete(context, qos_specs_id)
 
 
 def qos_specs_item_delete(context, qos_specs_id, key):
     """Delete specified key in the qos_specs."""
-    IMPL.qos_specs_item_delete(context, qos_specs_id, key)
+    return IMPL.qos_specs_item_delete(context, qos_specs_id, key)
 
 
 def qos_specs_update(context, qos_specs_id, specs):
@@ -536,7 +617,7 @@ def qos_specs_update(context, qos_specs_id, specs):
     This adds or modifies the key/value pairs specified in the
     specs dict argument for a given qos_specs.
     """
-    IMPL.qos_specs_update(context, qos_specs_id, specs)
+    return IMPL.qos_specs_update(context, qos_specs_id, specs)
 
 
 ###################
@@ -693,31 +774,6 @@ def quota_usage_get_all_by_project(context, project_id):
 ###################
 
 
-def reservation_create(context, uuid, usage, project_id, resource, delta,
-                       expire):
-    """Create a reservation for the given project and resource."""
-    return IMPL.reservation_create(context, uuid, usage, project_id,
-                                   resource, delta, expire)
-
-
-def reservation_get(context, uuid):
-    """Retrieve a reservation or raise if it does not exist."""
-    return IMPL.reservation_get(context, uuid)
-
-
-def reservation_get_all_by_project(context, project_id):
-    """Retrieve all reservations associated with a given project."""
-    return IMPL.reservation_get_all_by_project(context, project_id)
-
-
-def reservation_destroy(context, uuid):
-    """Destroy the reservation or raise if it does not exist."""
-    return IMPL.reservation_destroy(context, uuid)
-
-
-###################
-
-
 def quota_reserve(context, resources, quotas, deltas, expire,
                   until_refresh, max_age, project_id=None):
     """Check quotas and create appropriate reservations."""
@@ -737,9 +793,9 @@ def reservation_rollback(context, reservations, project_id=None):
                                      project_id=project_id)
 
 
-def quota_destroy_all_by_project(context, project_id):
+def quota_destroy_by_project(context, project_id):
     """Destroy all quotas associated with a given project."""
-    return IMPL.quota_destroy_all_by_project(context, project_id)
+    return IMPL.quota_destroy_by_project(context, project_id)
 
 
 def reservation_expire(context):
@@ -755,9 +811,9 @@ def backup_get(context, backup_id):
     return IMPL.backup_get(context, backup_id)
 
 
-def backup_get_all(context):
+def backup_get_all(context, filters=None):
     """Get all backups."""
-    return IMPL.backup_get_all(context)
+    return IMPL.backup_get_all(context, filters=filters)
 
 
 def backup_get_all_by_host(context, host):
@@ -770,9 +826,16 @@ def backup_create(context, values):
     return IMPL.backup_create(context, values)
 
 
-def backup_get_all_by_project(context, project_id):
+def backup_get_all_by_project(context, project_id, filters=None):
     """Get all backups belonging to a project."""
-    return IMPL.backup_get_all_by_project(context, project_id)
+    return IMPL.backup_get_all_by_project(context, project_id,
+                                          filters=filters)
+
+
+def backup_get_all_by_volume(context, volume_id, filters=None):
+    """Get all backups belonging to a volume."""
+    return IMPL.backup_get_all_by_volume(context, volume_id,
+                                         filters=filters)
 
 
 def backup_update(context, backup_id, values):
@@ -819,3 +882,103 @@ def transfer_destroy(context, transfer_id):
 def transfer_accept(context, transfer_id, user_id, project_id):
     """Accept a volume transfer."""
     return IMPL.transfer_accept(context, transfer_id, user_id, project_id)
+
+
+###################
+
+
+def consistencygroup_get(context, consistencygroup_id):
+    """Get a consistencygroup or raise if it does not exist."""
+    return IMPL.consistencygroup_get(context, consistencygroup_id)
+
+
+def consistencygroup_get_all(context):
+    """Get all consistencygroups."""
+    return IMPL.consistencygroup_get_all(context)
+
+
+def consistencygroup_create(context, values):
+    """Create a consistencygroup from the values dictionary."""
+    return IMPL.consistencygroup_create(context, values)
+
+
+def consistencygroup_get_all_by_project(context, project_id):
+    """Get all consistencygroups belonging to a project."""
+    return IMPL.consistencygroup_get_all_by_project(context, project_id)
+
+
+def consistencygroup_update(context, consistencygroup_id, values):
+    """Set the given properties on a consistencygroup and update it.
+
+    Raises NotFound if consistencygroup does not exist.
+    """
+    return IMPL.consistencygroup_update(context, consistencygroup_id, values)
+
+
+def consistencygroup_destroy(context, consistencygroup_id):
+    """Destroy the consistencygroup or raise if it does not exist."""
+    return IMPL.consistencygroup_destroy(context, consistencygroup_id)
+
+
+###################
+
+
+def cgsnapshot_get(context, cgsnapshot_id):
+    """Get a cgsnapshot or raise if it does not exist."""
+    return IMPL.cgsnapshot_get(context, cgsnapshot_id)
+
+
+def cgsnapshot_get_all(context):
+    """Get all cgsnapshots."""
+    return IMPL.cgsnapshot_get_all(context)
+
+
+def cgsnapshot_create(context, values):
+    """Create a cgsnapshot from the values dictionary."""
+    return IMPL.cgsnapshot_create(context, values)
+
+
+def cgsnapshot_get_all_by_group(context, group_id):
+    """Get all cgsnapshots belonging to a consistency group."""
+    return IMPL.cgsnapshot_get_all_by_group(context, group_id)
+
+
+def cgsnapshot_get_all_by_project(context, project_id):
+    """Get all cgsnapshots belonging to a project."""
+    return IMPL.cgsnapshot_get_all_by_project(context, project_id)
+
+
+def cgsnapshot_update(context, cgsnapshot_id, values):
+    """Set the given properties on a cgsnapshot and update it.
+
+    Raises NotFound if cgsnapshot does not exist.
+    """
+    return IMPL.cgsnapshot_update(context, cgsnapshot_id, values)
+
+
+def cgsnapshot_destroy(context, cgsnapshot_id):
+    """Destroy the cgsnapshot or raise if it does not exist."""
+    return IMPL.cgsnapshot_destroy(context, cgsnapshot_id)
+
+
+def purge_deleted_rows(context, age_in_days):
+    """Purge deleted rows older than given age from cinder tables
+
+    Raises InvalidParameterValue if age_in_days is incorrect.
+    :returns: number of deleted rows
+    """
+    return IMPL.purge_deleted_rows(context, age_in_days=age_in_days)
+
+
+###################
+
+
+def driver_initiator_data_update(context, initiator, namespace, updates):
+    """Create DriverPrivateData from the values dictionary."""
+    return IMPL.driver_initiator_data_update(context, initiator,
+                                             namespace, updates)
+
+
+def driver_initiator_data_get(context, initiator, namespace):
+    """Query for an DriverPrivateData that has the specified key"""
+    return IMPL.driver_initiator_data_get(context, initiator, namespace)

@@ -1,4 +1,6 @@
 # Copyright (C) 2012 Hewlett-Packard Development Company, L.P.
+# Copyright (c) 2014 TrilioData, Inc
+# Copyright (c) 2015 EMC Corporation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,7 +17,7 @@
 
 """The backups api."""
 
-
+from oslo_log import log as logging
 import webob
 from webob import exc
 
@@ -26,9 +28,8 @@ from cinder.api.views import backups as backup_views
 from cinder.api import xmlutil
 from cinder import backup as backupAPI
 from cinder import exception
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder import utils
-
 
 LOG = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def make_backup(elem):
     elem.set('status')
     elem.set('size')
     elem.set('container')
+    elem.set('parent_id')
     elem.set('volume_id')
     elem.set('object_count')
     elem.set('availability_zone')
@@ -50,6 +52,11 @@ def make_backup(elem):
 def make_backup_restore(elem):
     elem.set('backup_id')
     elem.set('volume_id')
+
+
+def make_backup_export_import_record(elem):
+    elem.set('backup_service')
+    elem.set('backup_url')
 
 
 class BackupTemplate(xmlutil.TemplateBuilder):
@@ -80,6 +87,16 @@ class BackupRestoreTemplate(xmlutil.TemplateBuilder):
         return xmlutil.MasterTemplate(root, 1, nsmap={alias: namespace})
 
 
+class BackupExportImportTemplate(xmlutil.TemplateBuilder):
+    def construct(self):
+        root = xmlutil.TemplateElement('backup-record',
+                                       selector='backup-record')
+        make_backup_export_import_record(root)
+        alias = Backups.alias
+        namespace = Backups.namespace
+        return xmlutil.MasterTemplate(root, 1, nsmap={alias: namespace})
+
+
 class CreateDeserializer(wsgi.MetadataXMLDeserializer):
     def default(self, string):
         dom = utils.safe_minidom_parse_string(string)
@@ -91,7 +108,8 @@ class CreateDeserializer(wsgi.MetadataXMLDeserializer):
         backup_node = self.find_first_child_named(node, 'backup')
 
         attributes = ['container', 'display_name',
-                      'display_description', 'volume_id']
+                      'display_description', 'volume_id',
+                      'parent_id']
 
         for attr in attributes:
             if backup_node.getAttribute(attr):
@@ -113,6 +131,25 @@ class RestoreDeserializer(wsgi.MetadataXMLDeserializer):
         return restore
 
 
+class BackupImportDeserializer(wsgi.MetadataXMLDeserializer):
+    def default(self, string):
+        dom = utils.safe_minidom_parse_string(string)
+        backup = self._extract_backup(dom)
+        retval = {'body': {'backup-record': backup}}
+        return retval
+
+    def _extract_backup(self, node):
+        backup = {}
+        backup_node = self.find_first_child_named(node, 'backup-record')
+
+        attributes = ['backup_service', 'backup_url']
+
+        for attr in attributes:
+            if backup_node.getAttribute(attr):
+                backup[attr] = backup_node.getAttribute(attr)
+        return backup
+
+
 class BackupsController(wsgi.Controller):
     """The Backups API controller for the OpenStack API."""
 
@@ -125,11 +162,12 @@ class BackupsController(wsgi.Controller):
     @wsgi.serializers(xml=BackupTemplate)
     def show(self, req, id):
         """Return data about the given backup."""
-        LOG.debug(_('show called for member %s'), id)
+        LOG.debug('show called for member %s', id)
         context = req.environ['cinder.context']
 
         try:
             backup = self.backup_api.get(context, backup_id=id)
+            req.cache_db_backup(backup)
         except exception.BackupNotFound as error:
             raise exc.HTTPNotFound(explanation=error.msg)
 
@@ -137,10 +175,10 @@ class BackupsController(wsgi.Controller):
 
     def delete(self, req, id):
         """Delete a backup."""
-        LOG.debug(_('delete called for member %s'), id)
+        LOG.debug('delete called for member %s', id)
         context = req.environ['cinder.context']
 
-        LOG.audit(_('Delete backup with id: %s'), id, context=context)
+        LOG.info(_LI('Delete backup with id: %s'), id, context=context)
 
         try:
             self.backup_api.delete(context, id)
@@ -161,16 +199,35 @@ class BackupsController(wsgi.Controller):
         """Returns a detailed list of backups."""
         return self._get_backups(req, is_detail=True)
 
+    @staticmethod
+    def _get_backup_filter_options():
+        """Return volume search options allowed by non-admin."""
+        return ('name', 'status', 'volume_id')
+
     def _get_backups(self, req, is_detail):
         """Returns a list of backups, transformed through view builder."""
         context = req.environ['cinder.context']
-        backups = self.backup_api.get_all(context)
+        filters = req.params.copy()
+
+        utils.remove_invalid_filter_options(context,
+                                            filters,
+                                            self._get_backup_filter_options())
+
+        if 'name' in filters:
+            filters['display_name'] = filters['name']
+            del filters['name']
+
+        backups = self.backup_api.get_all(context, search_opts=filters)
+        backup_count = len(backups)
         limited_list = common.limited(backups, req)
+        req.cache_db_backups(limited_list)
 
         if is_detail:
-            backups = self._view_builder.detail_list(req, limited_list)
+            backups = self._view_builder.detail_list(req, limited_list,
+                                                     backup_count)
         else:
-            backups = self._view_builder.summary_list(req, limited_list)
+            backups = self._view_builder.summary_list(req, limited_list,
+                                                      backup_count)
         return backups
 
     # TODO(frankm): Add some checks here including
@@ -182,7 +239,7 @@ class BackupsController(wsgi.Controller):
     @wsgi.deserializers(xml=CreateDeserializer)
     def create(self, req, body):
         """Create a new backup."""
-        LOG.debug(_('Creating new backup %s'), body)
+        LOG.debug('Creating new backup %s', body)
         if not self.is_valid_body(body, 'backup'):
             raise exc.HTTPBadRequest()
 
@@ -197,15 +254,17 @@ class BackupsController(wsgi.Controller):
         container = backup.get('container', None)
         name = backup.get('name', None)
         description = backup.get('description', None)
+        incremental = backup.get('incremental', False)
 
-        LOG.audit(_("Creating backup of volume %(volume_id)s in container"
-                    " %(container)s"),
-                  {'volume_id': volume_id, 'container': container},
-                  context=context)
+        LOG.info(_LI("Creating backup of volume %(volume_id)s in container"
+                     " %(container)s"),
+                 {'volume_id': volume_id, 'container': container},
+                 context=context)
 
         try:
             new_backup = self.backup_api.create(context, name, description,
-                                                volume_id, container)
+                                                volume_id, container,
+                                                incremental)
         except exception.InvalidVolume as error:
             raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.VolumeNotFound as error:
@@ -221,7 +280,7 @@ class BackupsController(wsgi.Controller):
     @wsgi.deserializers(xml=RestoreDeserializer)
     def restore(self, req, id, body):
         """Restore an existing backup to a volume."""
-        LOG.debug(_('Restoring backup %(backup_id)s (%(body)s)'),
+        LOG.debug('Restoring backup %(backup_id)s (%(body)s)',
                   {'backup_id': id, 'body': body})
         if not self.is_valid_body(body, 'restore'):
             msg = _("Incorrect request body format")
@@ -231,9 +290,9 @@ class BackupsController(wsgi.Controller):
         restore = body['restore']
         volume_id = restore.get('volume_id', None)
 
-        LOG.audit(_("Restoring backup %(backup_id)s to volume %(volume_id)s"),
-                  {'backup_id': id, 'volume_id': volume_id},
-                  context=context)
+        LOG.info(_LI("Restoring backup %(backup_id)s to volume %(volume_id)s"),
+                 {'backup_id': id, 'volume_id': volume_id},
+                 context=context)
 
         try:
             new_restore = self.backup_api.restore(context,
@@ -260,6 +319,61 @@ class BackupsController(wsgi.Controller):
             req, dict(new_restore.iteritems()))
         return retval
 
+    @wsgi.response(200)
+    @wsgi.serializers(xml=BackupExportImportTemplate)
+    def export_record(self, req, id):
+        """Export a backup."""
+        LOG.debug('export record called for member %s.', id)
+        context = req.environ['cinder.context']
+
+        try:
+            backup_info = self.backup_api.export_record(context, id)
+        except exception.BackupNotFound as error:
+            raise exc.HTTPNotFound(explanation=error.msg)
+        except exception.InvalidBackup as error:
+            raise exc.HTTPBadRequest(explanation=error.msg)
+
+        retval = self._view_builder.export_summary(
+            req, dict(backup_info.iteritems()))
+        LOG.debug('export record output: %s.', retval)
+        return retval
+
+    @wsgi.response(201)
+    @wsgi.serializers(xml=BackupTemplate)
+    @wsgi.deserializers(xml=BackupImportDeserializer)
+    def import_record(self, req, body):
+        """Import a backup."""
+        LOG.debug('Importing record from %s.', body)
+        if not self.is_valid_body(body, 'backup-record'):
+            msg = _("Incorrect request body format.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        context = req.environ['cinder.context']
+        import_data = body['backup-record']
+        # Verify that body elements are provided
+        try:
+            backup_service = import_data['backup_service']
+            backup_url = import_data['backup_url']
+        except KeyError:
+            msg = _("Incorrect request body format.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        LOG.debug('Importing backup using %(service)s and url %(url)s.',
+                  {'service': backup_service, 'url': backup_url})
+
+        try:
+            new_backup = self.backup_api.import_record(context,
+                                                       backup_service,
+                                                       backup_url)
+        except exception.BackupNotFound as error:
+            raise exc.HTTPNotFound(explanation=error.msg)
+        except exception.InvalidBackup as error:
+            raise exc.HTTPBadRequest(explanation=error.msg)
+        except exception.ServiceNotFound as error:
+            raise exc.HTTPInternalServerError(explanation=error.msg)
+
+        retval = self._view_builder.summary(req, dict(new_backup.iteritems()))
+        LOG.debug('import record output: %s.', retval)
+        return retval
+
 
 class Backups(extensions.ExtensionDescriptor):
     """Backups support."""
@@ -273,7 +387,8 @@ class Backups(extensions.ExtensionDescriptor):
         resources = []
         res = extensions.ResourceExtension(
             Backups.alias, BackupsController(),
-            collection_actions={'detail': 'GET'},
-            member_actions={'restore': 'POST'})
+            collection_actions={'detail': 'GET', 'import_record': 'POST'},
+            member_actions={'restore': 'POST', 'export_record': 'GET',
+                            'action': 'POST'})
         resources.append(res)
         return resources

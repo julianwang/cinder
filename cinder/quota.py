@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -21,14 +19,16 @@
 
 import datetime
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
+from oslo_utils import timeutils
 
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder.openstack.common import importutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _, _LE
+from cinder.openstack.common import versionutils
 
 
 LOG = logging.getLogger(__name__)
@@ -36,29 +36,40 @@ LOG = logging.getLogger(__name__)
 quota_opts = [
     cfg.IntOpt('quota_volumes',
                default=10,
-               help='number of volumes allowed per project'),
+               help='Number of volumes allowed per project'),
     cfg.IntOpt('quota_snapshots',
                default=10,
-               help='number of volume snapshots allowed per project'),
+               help='Number of volume snapshots allowed per project'),
+    cfg.IntOpt('quota_consistencygroups',
+               default=10,
+               help='Number of consistencygroups allowed per project'),
     cfg.IntOpt('quota_gigabytes',
                default=1000,
-               help='number of volume gigabytes (snapshots are also included) '
-                    'allowed per project'),
+               help='Total amount of storage, in gigabytes, allowed '
+                    'for volumes and snapshots per project'),
+    cfg.IntOpt('quota_backups',
+               default=10,
+               help='Number of volume backups allowed per project'),
+    cfg.IntOpt('quota_backup_gigabytes',
+               default=1000,
+               help='Total amount of storage, in gigabytes, allowed '
+                    'for backups per project'),
     cfg.IntOpt('reservation_expire',
                default=86400,
-               help='number of seconds until a reservation expires'),
+               help='Number of seconds until a reservation expires'),
     cfg.IntOpt('until_refresh',
                default=0,
-               help='count of reservations until usage is refreshed'),
+               help='Count of reservations until usage is refreshed'),
     cfg.IntOpt('max_age',
                default=0,
-               help='number of seconds between subsequent usage refreshes'),
+               help='Number of seconds between subsequent usage refreshes'),
     cfg.StrOpt('quota_driver',
                default='cinder.quota.DbQuotaDriver',
-               help='default driver to use for quota checks'),
+               help='Default driver to use for quota checks'),
     cfg.BoolOpt('use_default_quota_class',
                 default=True,
-                help='whether to use default quota class for default quota'), ]
+                help='Enables or disables use of default quota class '
+                     'with default quota.'), ]
 
 CONF = cfg.CONF
 CONF.register_opts(quota_opts)
@@ -102,13 +113,15 @@ class DbQuotaDriver(object):
         default_quotas = {}
         if CONF.use_default_quota_class:
             default_quotas = db.quota_class_get_default(context)
+
         for resource in resources.values():
             if resource.name not in default_quotas:
-                LOG.deprecated(_("Default quota for resource: %(res)s is set "
-                                 "by the default quota flag: quota_%(res)s, "
-                                 "it is now deprecated. Please use the "
-                                 "the default quota class for default "
-                                 "quota.") % {'res': resource.name})
+                versionutils.report_deprecated_feature(LOG, _(
+                    "Default quota for resource: %(res)s is set "
+                    "by the default quota flag: quota_%(res)s, "
+                    "it is now deprecated. Please use the "
+                    "default quota class for default "
+                    "quota.") % {'res': resource.name})
             quotas[resource.name] = default_quotas.get(resource.name,
                                                        resource.default)
 
@@ -231,8 +244,8 @@ class DbQuotaDriver(object):
         else:
             sync_filt = lambda x: not hasattr(x, 'sync')
         desired = set(keys)
-        sub_resources = dict((k, v) for k, v in resources.items()
-                             if k in desired and sync_filt(v))
+        sub_resources = {k: v for k, v in resources.items()
+                         if k in desired and sync_filt(v)}
 
         # Make sure we accounted for all of them...
         if len(keys) != len(sub_resources):
@@ -244,7 +257,7 @@ class DbQuotaDriver(object):
                                          project_id,
                                          context.quota_class, usages=False)
 
-        return dict((k, v['limit']) for k, v in quotas.items())
+        return {k: v['limit'] for k, v in quotas.items()}
 
     def limit_check(self, context, resources, values, project_id=None):
         """Check simple quota limits.
@@ -389,16 +402,15 @@ class DbQuotaDriver(object):
 
         db.reservation_rollback(context, reservations, project_id=project_id)
 
-    def destroy_all_by_project(self, context, project_id):
-        """Destroy all that is associated with a project.
+    def destroy_by_project(self, context, project_id):
+        """Destroy all limit quotas associated with a project.
 
-        This includes quotas, usages and reservations.
+        Leave usage and reservation quotas intact.
 
         :param context: The request context, for access checks.
         :param project_id: The ID of the project being deleted.
         """
-
-        db.quota_destroy_all_by_project(context, project_id)
+        db.quota_destroy_by_project(context, project_id)
 
     def expire(self, context):
         """Expire reservations.
@@ -747,7 +759,7 @@ class QuotaEngine(object):
                                             expire=expire,
                                             project_id=project_id)
 
-        LOG.debug(_("Created reservations %s") % reservations)
+        LOG.debug("Created reservations %s", reservations)
 
         return reservations
 
@@ -769,7 +781,8 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to commit reservations %s") % reservations)
+            LOG.exception(_LE("Failed to commit "
+                              "reservations %s"), reservations)
 
     def rollback(self, context, reservations, project_id=None):
         """Roll back reservations.
@@ -789,18 +802,17 @@ class QuotaEngine(object):
             # usage resynchronization and the reservation expiration
             # mechanisms will resolve the issue.  The exception is
             # logged, however, because this is less than optimal.
-            LOG.exception(_("Failed to roll back reservations "
-                            "%s") % reservations)
+            LOG.exception(_LE("Failed to roll back reservations "
+                              "%s"), reservations)
 
-    def destroy_all_by_project(self, context, project_id):
-        """Destroy all quotas, usages, and reservations associated with a
-        project.
+    def destroy_by_project(self, context, project_id):
+        """Destroy all quota limits associated with a project.
 
         :param context: The request context, for access checks.
         :param project_id: The ID of the project being deleted.
         """
 
-        self._driver.destroy_all_by_project(context, project_id)
+        self._driver.destroy_by_project(context, project_id)
 
     def expire(self, context):
         """Expire reservations.
@@ -858,16 +870,17 @@ class VolumeTypeQuotaEngine(QuotaEngine):
         # Global quotas.
         argses = [('volumes', '_sync_volumes', 'quota_volumes'),
                   ('snapshots', '_sync_snapshots', 'quota_snapshots'),
-                  ('gigabytes', '_sync_gigabytes', 'quota_gigabytes'), ]
+                  ('gigabytes', '_sync_gigabytes', 'quota_gigabytes'),
+                  ('backups', '_sync_backups', 'quota_backups'),
+                  ('backup_gigabytes', '_sync_backup_gigabytes',
+                   'quota_backup_gigabytes')]
         for args in argses:
             resource = ReservableResource(*args)
             result[resource.name] = resource
 
         # Volume type quotas.
-        # NOTE(jdg): We also want to check deleted types here as well
-        # if we don't the _get_quotas resource len check on will fail
         volume_types = db.volume_type_get_all(context.get_admin_context(),
-                                              True)
+                                              False)
         for volume_type in volume_types.values():
             for part_name in ('volumes', 'gigabytes', 'snapshots'):
                 resource = VolumeTypeResource(part_name, volume_type)
@@ -880,4 +893,29 @@ class VolumeTypeQuotaEngine(QuotaEngine):
     def register_resources(self, resources):
         raise NotImplementedError(_("Cannot register resources"))
 
+
+class CGQuotaEngine(QuotaEngine):
+    """Represent the consistencygroup quotas."""
+
+    @property
+    def resources(self):
+        """Fetches all possible quota resources."""
+
+        result = {}
+        # Global quotas.
+        argses = [('consistencygroups', '_sync_consistencygroups',
+                   'quota_consistencygroups'), ]
+        for args in argses:
+            resource = ReservableResource(*args)
+            result[resource.name] = resource
+
+        return result
+
+    def register_resource(self, resource):
+        raise NotImplementedError(_("Cannot register resource"))
+
+    def register_resources(self, resources):
+        raise NotImplementedError(_("Cannot register resources"))
+
 QUOTAS = VolumeTypeQuotaEngine()
+CGQUOTAS = CGQuotaEngine()

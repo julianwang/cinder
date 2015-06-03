@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # All Rights Reserved.
 #
@@ -18,18 +16,20 @@
 Default Driver for san-stored volumes.
 
 The unique thing about a SAN is that we don't expect that we can run the volume
-controller on the SAN hardware.  We expect to access it over SSH or some API.
+controller on the SAN hardware. We expect to access it over SSH or some API.
 """
 
 import random
 
 from eventlet import greenthread
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
 
 from cinder import exception
-from cinder.openstack.common import excutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import processutils
+from cinder.i18n import _, _LE
+from cinder import ssh_utils
 from cinder import utils
 from cinder.volume import driver
 
@@ -98,8 +98,7 @@ class SanDriver(driver.VolumeDriver):
             return utils.execute(*cmd, **kwargs)
         else:
             check_exit_code = kwargs.pop('check_exit_code', None)
-            command = ' '.join(cmd)
-            return self._run_ssh(command, check_exit_code)
+            return self._run_ssh(cmd, check_exit_code)
 
     def _run_ssh(self, cmd_list, check_exit_code=True, attempts=1):
         utils.check_ssh_injection(cmd_list)
@@ -110,17 +109,17 @@ class SanDriver(driver.VolumeDriver):
             privatekey = self.configuration.san_private_key
             min_size = self.configuration.ssh_min_pool_conn
             max_size = self.configuration.ssh_max_pool_conn
-            self.sshpool = utils.SSHPool(self.configuration.san_ip,
-                                         self.configuration.san_ssh_port,
-                                         self.configuration.ssh_conn_timeout,
-                                         self.configuration.san_login,
-                                         password=password,
-                                         privatekey=privatekey,
-                                         min_size=min_size,
-                                         max_size=max_size)
+            self.sshpool = ssh_utils.SSHPool(
+                self.configuration.san_ip,
+                self.configuration.san_ssh_port,
+                self.configuration.ssh_conn_timeout,
+                self.configuration.san_login,
+                password=password,
+                privatekey=privatekey,
+                min_size=min_size,
+                max_size=max_size)
         last_exception = None
         try:
-            total_attempts = attempts
             with self.sshpool.item() as ssh:
                 while attempts > 0:
                     attempts -= 1
@@ -148,7 +147,7 @@ class SanDriver(driver.VolumeDriver):
 
         except Exception:
             with excutils.save_and_reraise_exception():
-                LOG.error(_("Error running SSH command: %s") % command)
+                LOG.error(_LE("Error running SSH command: %s"), command)
 
     def ensure_export(self, context, volume):
         """Synchronously recreates an export for a logical volume."""

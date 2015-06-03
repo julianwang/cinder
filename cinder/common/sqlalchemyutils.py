@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2010-2011 OpenStack Foundation
@@ -20,10 +18,11 @@
 
 """Implementation of paginate query."""
 
+from oslo_log import log as logging
 import sqlalchemy
 
 from cinder import exception
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LW
 
 
 LOG = logging.getLogger(__name__)
@@ -65,7 +64,7 @@ def paginate_query(query, model, limit, sort_keys, marker=None,
     if 'id' not in sort_keys:
         # TODO(justinsb): If this ever gives a false-positive, check
         # the actual primary key, rather than assuming its id
-        LOG.warn(_('Id not in sort_keys; is sort_keys unique?'))
+        LOG.warning(_LW('Id not in sort_keys; is sort_keys unique?'))
 
     assert(not (sort_dir and sort_dirs))
 

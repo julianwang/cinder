@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 Zadara Storage Inc.
 # Copyright (c) 2011 OpenStack Foundation
 #
@@ -19,12 +17,14 @@
 
 import webob
 
+from cinder.api import common
 from cinder.api import extensions
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import db
 from cinder import exception
-from cinder.openstack.common.notifier import api as notifier_api
+from cinder.i18n import _
+from cinder import rpc
 from cinder.volume import volume_types
 
 authorize = extensions.extension_authorizer('volume', 'types_extra_specs')
@@ -83,15 +83,15 @@ class VolumeTypeExtraSpecsController(wsgi.Controller):
             raise webob.exc.HTTPBadRequest()
 
         self._check_type(context, type_id)
-
         specs = body['extra_specs']
+        self._check_key_names(specs.keys())
         db.volume_type_extra_specs_update_or_create(context,
                                                     type_id,
                                                     specs)
         notifier_info = dict(type_id=type_id, specs=specs)
-        notifier_api.notify(context, 'volumeTypeExtraSpecs',
-                            'volume_type_extra_specs.create',
-                            notifier_api.INFO, notifier_info)
+        notifier = rpc.get_notifier('volumeTypeExtraSpecs')
+        notifier.info(context, 'volume_type_extra_specs.create',
+                      notifier_info)
         return body
 
     @wsgi.serializers(xml=VolumeTypeExtraSpecTemplate)
@@ -112,9 +112,10 @@ class VolumeTypeExtraSpecsController(wsgi.Controller):
                                                     type_id,
                                                     body)
         notifier_info = dict(type_id=type_id, id=id)
-        notifier_api.notify(context, 'volumeTypeExtraSpecs',
-                            'volume_type_extra_specs.update',
-                            notifier_api.INFO, notifier_info)
+        notifier = rpc.get_notifier('volumeTypeExtraSpecs')
+        notifier.info(context,
+                      'volume_type_extra_specs.update',
+                      notifier_info)
         return body
 
     @wsgi.serializers(xml=VolumeTypeExtraSpecTemplate)
@@ -141,14 +142,22 @@ class VolumeTypeExtraSpecsController(wsgi.Controller):
             raise webob.exc.HTTPNotFound(explanation=error.msg)
 
         notifier_info = dict(type_id=type_id, id=id)
-        notifier_api.notify(context, 'volumeTypeExtraSpecs',
-                            'volume_type_extra_specs.delete',
-                            notifier_api.INFO, notifier_info)
+        notifier = rpc.get_notifier('volumeTypeExtraSpecs')
+        notifier.info(context,
+                      'volume_type_extra_specs.delete',
+                      notifier_info)
         return webob.Response(status_int=202)
+
+    def _check_key_names(self, keys):
+        if not common.validate_key_names(keys):
+            expl = _('Key names can only contain alphanumeric characters, '
+                     'underscores, periods, colons and hyphens.')
+
+            raise webob.exc.HTTPBadRequest(explanation=expl)
 
 
 class Types_extra_specs(extensions.ExtensionDescriptor):
-    """Types extra specs support"""
+    """Type extra specs support."""
 
     name = "TypesExtraSpecs"
     alias = "os-types-extra-specs"

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # Copyright 2013 NTT corp.
 # All Rights Reserved.
@@ -27,15 +25,17 @@ import random
 import shutil
 import sys
 import time
-import urlparse
 
 import glanceclient.exc
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+import six.moves.urllib.parse as urlparse
 
 from cinder import exception
-from cinder.openstack.common import jsonutils
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.i18n import _LE, _LW
+
 
 glance_opts = [
     cfg.ListOpt('allowed_direct_url_schemes',
@@ -44,8 +44,17 @@ glance_opts = [
                      'via the direct_url.  Currently supported schemes: '
                      '[file].'),
 ]
+glance_core_properties = [
+    cfg.ListOpt('glance_core_properties',
+                default=['checksum', 'container_format',
+                         'disk_format', 'image_name', 'image_id',
+                         'min_disk', 'min_ram', 'name', 'size'],
+                help='Default core properties of image')
+]
 CONF = cfg.CONF
 CONF.register_opts(glance_opts)
+CONF.register_opts(glance_core_properties)
+CONF.import_opt('glance_api_version', 'cinder.common.config')
 
 LOG = logging.getLogger(__name__)
 
@@ -65,8 +74,7 @@ def _parse_image_ref(image_href):
     return (image_id, netloc, use_ssl)
 
 
-def _create_glance_client(context, netloc, use_ssl,
-                          version=CONF.glance_api_version):
+def _create_glance_client(context, netloc, use_ssl, version=None):
     """Instantiate a new glanceclient.Client object."""
     if version is None:
         version = CONF.glance_api_version
@@ -76,6 +84,7 @@ def _create_glance_client(context, netloc, use_ssl,
         # https specific params
         params['insecure'] = CONF.glance_api_insecure
         params['ssl_compression'] = CONF.glance_api_ssl_compression
+        params['cacert'] = CONF.glance_ca_certificates_file
     else:
         scheme = 'http'
     if CONF.auth_strategy == 'keystone':
@@ -119,6 +128,13 @@ class GlanceClientWrapper(object):
         self.api_servers = None
         self.version = version
 
+        if CONF.glance_num_retries < 0:
+            LOG.warning(_LW(
+                "glance_num_retries shouldn't be a negative value. "
+                "The number of retries will be set to 0 until this is"
+                "corrected in the cinder.conf."))
+            CONF.set_override('glance_num_retries', 0)
+
     def _create_static_client(self, context, netloc, use_ssl, version):
         """Create a client that we'll use for every call."""
         self.netloc = netloc
@@ -144,7 +160,7 @@ class GlanceClientWrapper(object):
         retry the request according to CONF.glance_num_retries.
         """
         version = self.version
-        if version in kwargs:
+        if 'version' in kwargs:
             version = kwargs['version']
 
         retry_excs = (glanceclient.exc.ServiceUnavailable,
@@ -160,23 +176,19 @@ class GlanceClientWrapper(object):
             except retry_excs as e:
                 netloc = self.netloc
                 extra = "retrying"
-                error_msg = _("Error contacting glance server "
-                              "'%(netloc)s' for '%(method)s', "
-                              "%(extra)s.") % {'netloc': netloc,
-                                               'method': method,
-                                               'extra': extra,
-                                               }
+                error_msg = _LE("Error contacting glance server "
+                                "'%(netloc)s' for '%(method)s', "
+                                "%(extra)s.")
                 if attempt == num_attempts:
                     extra = 'done trying'
-                    error_msg = _("Error contacting glance server "
-                                  "'%(netloc)s' for '%(method)s', "
-                                  "%(extra)s.") % {'netloc': netloc,
-                                                   'method': method,
-                                                   'extra': extra,
-                                                   }
-                    LOG.exception(error_msg)
-                    raise exception.GlanceConnectionFailed(reason=str(e))
-                LOG.exception(error_msg)
+                    LOG.exception(error_msg, {'netloc': netloc,
+                                              'method': method,
+                                              'extra': extra})
+                    raise exception.GlanceConnectionFailed(reason=e)
+
+                LOG.exception(error_msg, {'netloc': netloc,
+                                          'method': method,
+                                          'extra': extra})
                 time.sleep(1)
 
 
@@ -230,8 +242,9 @@ class GlanceImageService(object):
         return base_image_meta
 
     def get_location(self, context, image_id):
-        """Returns the direct url representing the backend storage location,
-        or None if this attribute is not shown by Glance.
+        """Returns a tuple of the direct url and locations representing the
+        backend storage location, or (None, None) if these attributes are not
+        shown by Glance.
         """
         if CONF.glance_api_version == 1:
             # image location not available in v1
@@ -254,16 +267,20 @@ class GlanceImageService(object):
 
     def download(self, context, image_id, data=None):
         """Calls out to Glance for data and writes data."""
-        if 'file' in CONF.allowed_direct_url_schemes:
-            location = self.get_location(context, image_id)
-            o = urlparse.urlparse(location)
-            if o.scheme == "file":
-                with open(o.path, "r") as f:
+        if data and 'file' in CONF.allowed_direct_url_schemes:
+            direct_url, locations = self.get_location(context, image_id)
+            urls = [direct_url] + [loc.get('url') for loc in locations or []]
+            for url in urls:
+                if url is None:
+                    continue
+                parsed_url = urlparse.urlparse(url)
+                if parsed_url.scheme == "file":
                     # a system call to cp could have significant performance
                     # advantages, however we do not have the path to files at
                     # this point in the abstraction.
-                    shutil.copyfileobj(f, data)
-                return
+                    with open(parsed_url.path, "r") as f:
+                        shutil.copyfileobj(f, data)
+                    return
 
         try:
             image_chunks = self._client.call(context, 'data', image_id)
@@ -292,16 +309,16 @@ class GlanceImageService(object):
                image_meta, data=None, purge_props=True):
         """Modify the given image with the new data."""
         image_meta = self._translate_to_glance(image_meta)
-        #NOTE(dosaboy): see comment in bug 1210467
+        # NOTE(dosaboy): see comment in bug 1210467
         if CONF.glance_api_version == 1:
             image_meta['purge_props'] = purge_props
-        #NOTE(bcwaldon): id is not an editable field, but it is likely to be
+        # NOTE(bcwaldon): id is not an editable field, but it is likely to be
         # passed in by calling code. Let's be nice and ignore it.
         image_meta.pop('id', None)
         if data:
             image_meta['data'] = data
         try:
-            #NOTE(dosaboy): the v2 api separates update from upload
+            # NOTE(dosaboy): the v2 api separates update from upload
             if data and CONF.glance_api_version > 1:
                 image_meta = self._client.call(context, 'upload', image_id,
                                                image_meta['data'])
@@ -414,16 +431,38 @@ def _convert_to_string(metadata):
 
 
 def _extract_attributes(image):
+    # NOTE(hdd): If a key is not found, base.Resource.__getattr__() may perform
+    # a get(), resulting in a useless request back to glance. This list is
+    # therefore sorted, with dependent attributes as the end
+    # 'deleted_at' depends on 'deleted'
+    # 'checksum' depends on 'status' == 'active'
     IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
-                        'container_format', 'checksum', 'id',
+                        'container_format', 'status', 'id',
                         'name', 'created_at', 'updated_at',
-                        'deleted_at', 'deleted', 'status',
+                        'deleted', 'deleted_at', 'checksum',
                         'min_disk', 'min_ram', 'is_public']
     output = {}
+
     for attr in IMAGE_ATTRIBUTES:
-        output[attr] = getattr(image, attr, None)
+        if attr == 'deleted_at' and not output['deleted']:
+            output[attr] = None
+        elif attr == 'checksum' and output['status'] != 'active':
+            output[attr] = None
+        else:
+            output[attr] = getattr(image, attr, None)
 
     output['properties'] = getattr(image, 'properties', {})
+
+    # NOTE(jbernard): Update image properties for API version 2.  For UEC
+    # images stored in glance, the necessary boot information is stored in the
+    # properties dict in version 1 so there is nothing more to do.  However, in
+    # version 2 these are standalone fields in the GET response.  This bit of
+    # code moves them back into the properties dict as the caller expects, thus
+    # producing a volume with correct metadata for booting.
+    for attr in ('kernel_id', 'ramdisk_id'):
+        value = getattr(image, attr, None)
+        if value:
+            output['properties'][attr] = value
 
     return output
 
@@ -439,14 +478,14 @@ def _remove_read_only(image_meta):
 
 def _reraise_translated_image_exception(image_id):
     """Transform the exception for the image but keep its traceback intact."""
-    exc_type, exc_value, exc_trace = sys.exc_info()
+    _exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_image_exception(image_id, exc_value)
     raise new_exc, None, exc_trace
 
 
 def _reraise_translated_exception():
     """Transform the exception but keep its traceback intact."""
-    exc_type, exc_value, exc_trace = sys.exc_info()
+    _exc_type, exc_value, exc_trace = sys.exc_info()
     new_exc = _translate_plain_exception(exc_value)
     raise new_exc, None, exc_trace
 
@@ -485,7 +524,7 @@ def get_remote_image_service(context, image_href):
     :returns: a tuple of the form (image_service, image_id)
 
     """
-    #NOTE(bcwaldon): If image_href doesn't look like a URI, assume its a
+    # NOTE(bcwaldon): If image_href doesn't look like a URI, assume its a
     # standalone image ID
     if '/' not in str(image_href):
         image_service = get_default_image_service()

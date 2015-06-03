@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation.
 # All Rights Reserved.
 #
@@ -20,6 +18,7 @@ import webob
 from cinder.api import common
 from cinder.api.openstack import wsgi
 from cinder import exception
+from cinder.i18n import _
 from cinder import volume
 
 

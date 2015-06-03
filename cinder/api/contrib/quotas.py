@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_utils import strutils
 import webob
 
 from cinder.api import extensions
@@ -23,8 +22,7 @@ from cinder.api import xmlutil
 from cinder import db
 from cinder.db.sqlalchemy import api as sqlalchemy_api
 from cinder import exception
-from cinder.openstack.common.gettextutils import _
-from cinder.openstack.common import strutils
+from cinder.i18n import _
 from cinder import quota
 
 
@@ -34,6 +32,7 @@ NON_QUOTA_KEYS = ['tenant_id', 'id']
 
 authorize_update = extensions.extension_authorizer('volume', 'quotas:update')
 authorize_show = extensions.extension_authorizer('volume', 'quotas:show')
+authorize_delete = extensions.extension_authorizer('volume', 'quotas:delete')
 
 
 class QuotaTemplate(xmlutil.TemplateBuilder):
@@ -51,14 +50,16 @@ class QuotaTemplate(xmlutil.TemplateBuilder):
 class QuotaSetsController(wsgi.Controller):
 
     def _format_quota_set(self, project_id, quota_set):
-        """Convert the quota object to a result dict"""
+        """Convert the quota object to a result dict."""
 
         quota_set['id'] = str(project_id)
 
         return dict(quota_set=quota_set)
 
     def _validate_quota_limit(self, limit):
-        if not isinstance(limit, int):
+        try:
+            limit = int(limit)
+        except (ValueError, TypeError):
             msg = _("Quota limit must be specified as an integer value.")
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
@@ -67,13 +68,15 @@ class QuotaSetsController(wsgi.Controller):
             msg = _("Quota limit must be -1 or greater.")
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
+        return limit
+
     def _get_quotas(self, context, id, usages=False):
         values = QUOTAS.get_project_quotas(context, id, usages=usages)
 
         if usages:
             return values
         else:
-            return dict((k, v['limit']) for k, v in values.items())
+            return {k: v['limit'] for k, v in values.items()}
 
     @wsgi.serializers(xml=QuotaTemplate)
     def show(self, req, id):
@@ -104,6 +107,8 @@ class QuotaSetsController(wsgi.Controller):
 
         bad_keys = []
 
+        # NOTE(ankit): Pass #1 - In this loop for body['quota_set'].items(),
+        # we figure out if we have any bad keys.
         for key, value in body['quota_set'].items():
             if (key not in QUOTAS and key not in NON_QUOTA_KEYS):
                 bad_keys.append(key)
@@ -113,12 +118,22 @@ class QuotaSetsController(wsgi.Controller):
             msg = _("Bad key(s) in quota set: %s") % ",".join(bad_keys)
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
+        # NOTE(ankit): Pass #2 - In this loop for body['quota_set'].keys(),
+        # we validate the quota limits to ensure that we can bail out if
+        # any of the items in the set is bad.
+        valid_quotas = {}
         for key in body['quota_set'].keys():
             if key in NON_QUOTA_KEYS:
                 continue
 
-            self._validate_quota_limit(body['quota_set'][key])
-            value = int(body['quota_set'][key])
+            value = self._validate_quota_limit(body['quota_set'][key])
+            valid_quotas[key] = value
+
+        # NOTE(ankit): Pass #3 - At this point we know that all the keys and
+        # values are valid and we can iterate and update them all in one shot
+        # without having to worry about rolling back etc as we have done
+        # the validation up front in the 2 loops above.
+        for key, value in valid_quotas.items():
             try:
                 db.quota_update(context, project_id, key, value)
             except exception.ProjectQuotaNotFound:
@@ -133,9 +148,20 @@ class QuotaSetsController(wsgi.Controller):
         authorize_show(context)
         return self._format_quota_set(id, QUOTAS.get_defaults(context))
 
+    @wsgi.serializers(xml=QuotaTemplate)
+    def delete(self, req, id):
+
+        context = req.environ['cinder.context']
+        authorize_delete(context)
+
+        try:
+            db.quota_destroy_by_project(context, id)
+        except exception.AdminRequired:
+            raise webob.exc.HTTPForbidden()
+
 
 class Quotas(extensions.ExtensionDescriptor):
-    """Quotas management support"""
+    """Quota management support."""
 
     name = "Quotas"
     alias = "os-quota-sets"

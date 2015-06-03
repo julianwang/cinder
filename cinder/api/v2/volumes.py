@@ -17,6 +17,9 @@
 
 
 import ast
+
+from oslo_log import log as logging
+from oslo_utils import uuidutils
 import webob
 from webob import exc
 
@@ -24,11 +27,13 @@ from cinder.api import common
 from cinder.api.openstack import wsgi
 from cinder.api.v2.views import volumes as volume_views
 from cinder.api import xmlutil
+from cinder import consistencygroup as consistencygroupAPI
 from cinder import exception
-from cinder.openstack.common import log as logging
-from cinder.openstack.common import uuidutils
+from cinder.i18n import _, _LI
+from cinder.image import glance
 from cinder import utils
 from cinder import volume as cinder_volume
+from cinder.volume import utils as volume_utils
 from cinder.volume import volume_types
 
 
@@ -39,6 +44,7 @@ SCHEDULER_HINTS_NAMESPACE =\
 
 def make_attachment(elem):
     elem.set('id')
+    elem.set('attachment_id')
     elem.set('server_id')
     elem.set('host_name')
     elem.set('volume_id')
@@ -57,6 +63,8 @@ def make_volume(elem):
     elem.set('volume_type')
     elem.set('snapshot_id')
     elem.set('source_volid')
+    elem.set('consistencygroup_id')
+    elem.set('multiattach')
 
     attachments = xmlutil.SubTemplateElement(elem, 'attachments')
     attachment = xmlutil.SubTemplateElement(attachments, 'attachment',
@@ -117,7 +125,8 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
 
         attributes = ['name', 'description', 'size',
                       'volume_type', 'availability_zone', 'imageRef',
-                      'snapshot_id', 'source_volid']
+                      'image_id', 'snapshot_id', 'source_volid',
+                      'consistencygroup_id']
         for attr in attributes:
             if volume_node.getAttribute(attr):
                 volume[attr] = volume_node.getAttribute(attr)
@@ -152,58 +161,11 @@ class VolumeController(wsgi.Controller):
 
     _view_builder_class = volume_views.ViewBuilder
 
-    _visible_admin_metadata_keys = ['readonly', 'attached_mode']
-
     def __init__(self, ext_mgr):
         self.volume_api = cinder_volume.API()
+        self.consistencygroup_api = consistencygroupAPI.API()
         self.ext_mgr = ext_mgr
         super(VolumeController, self).__init__()
-
-    def _add_visible_admin_metadata(self, context, volume):
-        if context is None:
-            return
-
-        visible_admin_meta = {}
-
-        if context.is_admin:
-            volume_tmp = volume
-        else:
-            try:
-                volume_tmp = self.volume_api.get(context.elevated(),
-                                                 volume['id'])
-            except Exception:
-                return
-
-        if volume_tmp.get('volume_admin_metadata'):
-            for item in volume_tmp['volume_admin_metadata']:
-                if item['key'] in self._visible_admin_metadata_keys:
-                    visible_admin_meta[item['key']] = item['value']
-        # avoid circular ref when volume is a Volume instance
-        elif (volume_tmp.get('admin_metadata') and
-                isinstance(volume_tmp.get('admin_metadata'), dict)):
-            for key in self._visible_admin_metadata_keys:
-                if key in volume_tmp['admin_metadata'].keys():
-                    visible_admin_meta[key] = volume_tmp['admin_metadata'][key]
-
-        if not visible_admin_meta:
-            return
-
-        # NOTE(zhiyan): update visible administration metadata to
-        # volume metadata, administration metadata will rewrite existing key.
-        if volume.get('volume_metadata'):
-            orig_meta = list(volume.get('volume_metadata'))
-            for item in orig_meta:
-                if item['key'] in visible_admin_meta.keys():
-                    item['value'] = visible_admin_meta.pop(item['key'])
-            for key, value in visible_admin_meta.iteritems():
-                orig_meta.append({'key': key, 'value': value})
-            volume['volume_metadata'] = orig_meta
-        # avoid circular ref when vol is a Volume instance
-        elif (volume.get('metadata') and
-                isinstance(volume.get('metadata'), dict)):
-            volume['metadata'].update(visible_admin_meta)
-        else:
-            volume['metadata'] = visible_admin_meta
 
     @wsgi.serializers(xml=VolumeTemplate)
     def show(self, req, id):
@@ -211,13 +173,13 @@ class VolumeController(wsgi.Controller):
         context = req.environ['cinder.context']
 
         try:
-            vol = self.volume_api.get(context, id)
-            req.cache_resource(vol)
+            vol = self.volume_api.get(context, id, viewable_admin_meta=True)
+            req.cache_db_volume(vol)
         except exception.NotFound:
             msg = _("Volume could not be found")
             raise exc.HTTPNotFound(explanation=msg)
 
-        self._add_visible_admin_metadata(context, vol)
+        utils.add_visible_admin_metadata(vol)
 
         return self._view_builder.detail(req, vol)
 
@@ -225,7 +187,7 @@ class VolumeController(wsgi.Controller):
         """Delete a volume."""
         context = req.environ['cinder.context']
 
-        LOG.audit(_("Delete volume with id: %s"), id, context=context)
+        LOG.info(_LI("Delete volume with id: %s"), id, context=context)
 
         try:
             volume = self.volume_api.get(context, id)
@@ -256,53 +218,87 @@ class VolumeController(wsgi.Controller):
         params = req.params.copy()
         marker = params.pop('marker', None)
         limit = params.pop('limit', None)
-        sort_key = params.pop('sort_key', 'created_at')
-        sort_dir = params.pop('sort_dir', 'desc')
+        sort_keys, sort_dirs = common.get_sort_params(params)
         params.pop('offset', None)
         filters = params
 
-        remove_invalid_options(context,
-                               filters, self._get_volume_filter_options())
+        utils.remove_invalid_filter_options(context,
+                                            filters,
+                                            self._get_volume_filter_options())
 
         # NOTE(thingee): v2 API allows name instead of display_name
         if 'name' in filters:
             filters['display_name'] = filters['name']
             del filters['name']
 
-        if 'metadata' in filters:
-            filters['metadata'] = ast.literal_eval(filters['metadata'])
+        for k, v in filters.iteritems():
+            try:
+                filters[k] = ast.literal_eval(v)
+            except (ValueError, SyntaxError):
+                LOG.debug('Could not evaluate value %s, assuming string', v)
 
-        volumes = self.volume_api.get_all(context, marker, limit, sort_key,
-                                          sort_dir, filters)
+        volumes = self.volume_api.get_all(context, marker, limit,
+                                          sort_keys=sort_keys,
+                                          sort_dirs=sort_dirs,
+                                          filters=filters,
+                                          viewable_admin_meta=True)
 
         volumes = [dict(vol.iteritems()) for vol in volumes]
 
         for volume in volumes:
-            self._add_visible_admin_metadata(context, volume)
+            utils.add_visible_admin_metadata(volume)
 
         limited_list = common.limited(volumes, req)
+        volume_count = len(volumes)
+        req.cache_db_volumes(limited_list)
 
         if is_detail:
-            volumes = self._view_builder.detail_list(req, limited_list)
+            volumes = self._view_builder.detail_list(req, limited_list,
+                                                     volume_count)
         else:
-            volumes = self._view_builder.summary_list(req, limited_list)
-        req.cache_resource(limited_list)
+            volumes = self._view_builder.summary_list(req, limited_list,
+                                                      volume_count)
         return volumes
 
-    def _image_uuid_from_href(self, image_href):
-        # If the image href was generated by nova api, strip image_href
+    def _image_uuid_from_ref(self, image_ref, context):
+        # If the image ref was generated by nova api, strip image_ref
         # down to an id.
+        image_uuid = None
         try:
-            image_uuid = image_href.split('/').pop()
-        except (TypeError, AttributeError):
+            image_uuid = image_ref.split('/').pop()
+        except AttributeError:
             msg = _("Invalid imageRef provided.")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        if not uuidutils.is_uuid_like(image_uuid):
-            msg = _("Invalid imageRef provided.")
-            raise exc.HTTPBadRequest(explanation=msg)
+        image_service = glance.get_default_image_service()
 
-        return image_uuid
+        # First see if this is an actual image ID
+        if uuidutils.is_uuid_like(image_uuid):
+            try:
+                image = image_service.show(context, image_uuid)
+                if 'id' in image:
+                    return image['id']
+            except Exception:
+                # Pass and see if there is a matching image name
+                pass
+
+        # Could not find by ID, check if it is an image name
+        try:
+            params = {'filters': {'name': image_ref}}
+            images = list(image_service.detail(context, **params))
+            if len(images) > 1:
+                msg = _("Multiple matches found for '%s', use an ID to be more"
+                        " specific.") % image_ref
+                raise exc.HTTPConflict(msg)
+            for img in images:
+                return img['id']
+        except Exception:
+            # Pass and let default not found error handling take care of it
+            pass
+
+        msg = _("Invalid image identifier or unable to "
+                "access requested image.")
+        raise exc.HTTPBadRequest(explanation=msg)
 
     @wsgi.response(202)
     @wsgi.serializers(xml=VolumeTemplate)
@@ -324,10 +320,15 @@ class VolumeController(wsgi.Controller):
             volume['display_name'] = volume.get('name')
             del volume['name']
 
-        # NOTE(thingee): v2 API allows description instead of description
+        # NOTE(thingee): v2 API allows description instead of
+        #                display_description
         if volume.get('description'):
             volume['display_description'] = volume.get('description')
             del volume['description']
+
+        if 'image_id' in volume:
+            volume['imageRef'] = volume.get('image_id')
+            del volume['image_id']
 
         req_volume_type = volume.get('volume_type', None)
         if req_volume_type:
@@ -368,24 +369,56 @@ class VolumeController(wsgi.Controller):
         else:
             kwargs['source_volume'] = None
 
+        source_replica = volume.get('source_replica')
+        if source_replica is not None:
+            try:
+                src_vol = self.volume_api.get_volume(context,
+                                                     source_replica)
+                if src_vol['replication_status'] == 'disabled':
+                    explanation = _('source volume id:%s is not'
+                                    ' replicated') % source_volid
+                    raise exc.HTTPNotFound(explanation=explanation)
+                kwargs['source_replica'] = src_vol
+            except exception.NotFound:
+                explanation = (_('replica source volume id:%s not found') %
+                               source_replica)
+                raise exc.HTTPNotFound(explanation=explanation)
+        else:
+            kwargs['source_replica'] = None
+
+        consistencygroup_id = volume.get('consistencygroup_id')
+        if consistencygroup_id is not None:
+            try:
+                kwargs['consistencygroup'] = \
+                    self.consistencygroup_api.get(context,
+                                                  consistencygroup_id)
+            except exception.NotFound:
+                explanation = _('Consistency group id:%s not found') % \
+                    consistencygroup_id
+                raise exc.HTTPNotFound(explanation=explanation)
+        else:
+            kwargs['consistencygroup'] = None
+
         size = volume.get('size', None)
         if size is None and kwargs['snapshot'] is not None:
             size = kwargs['snapshot']['volume_size']
         elif size is None and kwargs['source_volume'] is not None:
             size = kwargs['source_volume']['size']
+        elif size is None and kwargs['source_replica'] is not None:
+            size = kwargs['source_replica']['size']
 
-        LOG.audit(_("Create volume of %s GB"), size, context=context)
+        LOG.info(_LI("Create volume of %s GB"), size, context=context)
 
-        image_href = None
-        image_uuid = None
         if self.ext_mgr.is_loaded('os-image-create'):
-            image_href = volume.get('imageRef')
-            if image_href:
-                image_uuid = self._image_uuid_from_href(image_href)
+            image_ref = volume.get('imageRef')
+            if image_ref is not None:
+                image_uuid = self._image_uuid_from_ref(image_ref, context)
                 kwargs['image_id'] = image_uuid
 
         kwargs['availability_zone'] = volume.get('availability_zone', None)
         kwargs['scheduler_hints'] = volume.get('scheduler_hints', None)
+        multiattach = volume.get('multiattach', False)
+        kwargs['multiattach'] = multiattach
 
         new_volume = self.volume_api.create(context,
                                             size,
@@ -397,10 +430,7 @@ class VolumeController(wsgi.Controller):
         #             trying to lazy load, but for now we turn it into
         #             a dict to avoid an error.
         new_volume = dict(new_volume.iteritems())
-
-        self._add_visible_admin_metadata(context, new_volume)
-
-        retval = self._view_builder.summary(req, new_volume)
+        retval = self._view_builder.detail(req, new_volume)
 
         return retval
 
@@ -427,6 +457,8 @@ class VolumeController(wsgi.Controller):
         valid_update_keys = (
             'name',
             'description',
+            'display_name',
+            'display_description',
             'metadata',
         )
 
@@ -445,7 +477,9 @@ class VolumeController(wsgi.Controller):
             del update_dict['description']
 
         try:
-            volume = self.volume_api.get(context, id)
+            volume = self.volume_api.get(context, id, viewable_admin_meta=True)
+            volume_utils.notify_about_volume_usage(context, volume,
+                                                   'update.start')
             self.volume_api.update(context, volume, update_dict)
         except exception.NotFound:
             msg = _("Volume could not be found")
@@ -453,25 +487,13 @@ class VolumeController(wsgi.Controller):
 
         volume.update(update_dict)
 
-        self._add_visible_admin_metadata(context, volume)
+        utils.add_visible_admin_metadata(volume)
+
+        volume_utils.notify_about_volume_usage(context, volume,
+                                               'update.end')
 
         return self._view_builder.detail(req, volume)
 
 
 def create_resource(ext_mgr):
     return wsgi.Resource(VolumeController(ext_mgr))
-
-
-def remove_invalid_options(context, filters, allowed_search_options):
-    """Remove search options that are not valid for non-admin API/context."""
-    if context.is_admin:
-        # Allow all options
-        return
-    # Otherwise, strip out all unknown options
-    unknown_options = [opt for opt in filters
-                       if opt not in allowed_search_options]
-    bad_options = ", ".join(unknown_options)
-    log_msg = _("Removing options '%s' from query") % bad_options
-    LOG.debug(log_msg)
-    for opt in unknown_options:
-        del filters[opt]

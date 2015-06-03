@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -18,22 +16,24 @@
 
 import os
 import re
-import urlparse
+import urllib
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+import six.moves.urllib.parse as urlparse
 import webob
 
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
-from cinder.openstack.common import log as logging
+from cinder.i18n import _
 from cinder import utils
 
 
 api_common_opts = [
     cfg.IntOpt('osapi_max_limit',
                default=1000,
-               help='the maximum number of items returned in a single '
-                    'response from a collection resource'),
+               help='The maximum number of items that a collection '
+                    'resource returns in a single response'),
     cfg.StrOpt('osapi_volume_base_URL',
                default=None,
                help='Base URL that will be presented to users in links '
@@ -47,7 +47,24 @@ CONF.register_opts(api_common_opts)
 LOG = logging.getLogger(__name__)
 
 
-XML_NS_V1 = 'http://docs.openstack.org/volume/api/v1'
+XML_NS_V1 = 'http://docs.openstack.org/api/openstack-block-storage/1.0/content'
+XML_NS_V2 = 'http://docs.openstack.org/api/openstack-block-storage/2.0/content'
+
+
+# Regex that matches alphanumeric characters, periods, hyphens,
+# colons and underscores:
+# ^ assert position at start of the string
+# [\w\.\-\:\_] match expression
+# $ assert position at end of the string
+VALID_KEY_NAME_REGEX = re.compile(r"^[\w\.\-\:\_]+$", re.UNICODE)
+
+
+def validate_key_names(key_names_list):
+    """Validate each item of the list to match key name regex."""
+    for key_name in key_names_list:
+        if not VALID_KEY_NAME_REGEX.match(key_name):
+            return False
+    return True
 
 
 def get_pagination_params(request):
@@ -71,7 +88,7 @@ def get_pagination_params(request):
 
 
 def _get_limit_param(request):
-    """Extract integer limit from request or fail"""
+    """Extract integer limit from request or fail."""
     try:
         limit = int(request.GET['limit'])
     except ValueError:
@@ -84,7 +101,7 @@ def _get_limit_param(request):
 
 
 def _get_marker_param(request):
-    """Extract marker id from request or fail"""
+    """Extract marker id from request or fail."""
     return request.GET['marker']
 
 
@@ -151,6 +168,53 @@ def limited_by_marker(items, request, max_limit=CONF.osapi_max_limit):
     return items[start_index:range_end]
 
 
+def get_sort_params(params, default_key='created_at', default_dir='desc'):
+    """Retrieves sort keys/directions parameters.
+
+    Processes the parameters to create a list of sort keys and sort directions
+    that correspond to either the 'sort' parameter or the 'sort_key' and
+    'sort_dir' parameter values. The value of the 'sort' parameter is a comma-
+    separated list of sort keys, each key is optionally appended with
+    ':<sort_direction>'.
+
+    Note that the 'sort_key' and 'sort_dir' parameters are deprecated in kilo
+    and an exception is raised if they are supplied with the 'sort' parameter.
+
+    The sort parameters are removed from the request parameters by this
+    function.
+
+    :param params: webob.multidict of request parameters (from
+                   cinder.api.openstack.wsgi.Request.params)
+    :param default_key: default sort key value, added to the list if no
+                        sort keys are supplied
+    :param default_dir: default sort dir value, added to the list if the
+                        corresponding key does not have a direction
+                        specified
+    :returns: list of sort keys, list of sort dirs
+    :raise webob.exc.HTTPBadRequest: If both 'sort' and either 'sort_key' or
+                                     'sort_dir' are supplied parameters
+    """
+    if 'sort' in params and ('sort_key' in params or 'sort_dir' in params):
+        msg = _("The 'sort_key' and 'sort_dir' parameters are deprecated and "
+                "cannot be used with the 'sort' parameter.")
+        raise webob.exc.HTTPBadRequest(explanation=msg)
+    sort_keys = []
+    sort_dirs = []
+    if 'sort' in params:
+        for sort in params.pop('sort').strip().split(','):
+            sort_key, _sep, sort_dir = sort.partition(':')
+            if not sort_dir:
+                sort_dir = default_dir
+            sort_keys.append(sort_key.strip())
+            sort_dirs.append(sort_dir.strip())
+    else:
+        sort_key = params.pop('sort_key', default_key)
+        sort_dir = params.pop('sort_dir', default_dir)
+        sort_keys.append(sort_key.strip())
+        sort_dirs.append(sort_dir.strip())
+    return sort_keys, sort_dirs
+
+
 def remove_version_from_href(href):
     """Removes the first api version from the href.
 
@@ -172,23 +236,13 @@ def remove_version_from_href(href):
     new_path = '/'.join(url_parts)
 
     if new_path == parsed_url.path:
-        msg = _('href %s does not contain version') % href
+        msg = 'href %s does not contain version' % href
         LOG.debug(msg)
         raise ValueError(msg)
 
     parsed_url = list(parsed_url)
     parsed_url[2] = new_path
     return urlparse.urlunsplit(parsed_url)
-
-
-def dict_to_query_str(params):
-    # TODO(throughnothing): we should just use urllib.urlencode instead of this
-    # But currently we don't work with urlencoded url's
-    param_str = ""
-    for key, val in params.iteritems():
-        param_str = param_str + '='.join([str(key), str(val)]) + '&'
-
-    return param_str.rstrip('&')
 
 
 class ViewBuilder(object):
@@ -202,7 +256,7 @@ class ViewBuilder(object):
                 {"rel": "bookmark",
                  "href": self._get_bookmark_link(request, identifier), }]
 
-    def _get_next_link(self, request, identifier):
+    def _get_next_link(self, request, identifier, collection_name):
         """Return href string with proper limit and marker params."""
         params = request.params.copy()
         params["marker"] = identifier
@@ -210,8 +264,8 @@ class ViewBuilder(object):
                                           CONF.osapi_volume_base_URL)
         url = os.path.join(prefix,
                            request.environ["cinder.context"].project_id,
-                           self._collection_name)
-        return "%s?%s" % (url, dict_to_query_str(params))
+                           collection_name)
+        return "%s?%s" % (url, urllib.urlencode(params))
 
     def _get_href_link(self, request, identifier):
         """Return an href string pointing to this object."""
@@ -232,20 +286,65 @@ class ViewBuilder(object):
                             self._collection_name,
                             str(identifier))
 
-    def _get_collection_links(self, request, items, id_key="uuid"):
-        """Retrieve 'next' link, if applicable."""
+    def _get_collection_links(self, request, items, collection_name,
+                              item_count, id_key="uuid"):
+        """Retrieve 'next' link, if applicable.
+
+        The next link is included if:
+        1) 'limit' param is specified and equal to or less than the
+        number of items.
+        2) 'limit' param is specified and both the limit and the number
+        of items are greater than CONF.osapi_max_limit, even if limit
+        is greater than the number of items.
+        3) 'limit' param is NOT specified and the number of items is
+        greater than CONF.osapi_max_limit.
+        Notes: The case limit equals to 0 or CONF.osapi_max_limit equals to 0
+        is not included in the above conditions.
+
+        :param request: API request
+        :param items: List of collection items
+        :param collection_name: Name of collection, used to generate the
+                                next link for a pagination query
+        :param item_count: Length of the list of the original collection
+                           items
+        :param id_key: Attribute key used to retrieve the unique ID, used
+                       to generate the next link marker for a pagination query
+        :returns links
+        """
+        limit = request.params.get("limit", None)
+        if limit is None or int(limit) > CONF.osapi_max_limit:
+            # If limit is not set in the request or greater than
+            # osapi_max_limit, len(items) < item_count means the items
+            # are limited by osapi_max_limit and we need to generate the
+            # next link. Otherwise, all the items will be returned in
+            # the response, no next link is generated.
+            if len(items) < item_count:
+                return self._generate_next_link(items, id_key, request,
+                                                collection_name)
+        else:
+            # If limit is set in the request and not more than
+            # osapi_max_limit, int(limit) == len(items) means it is possible
+            # that the DB still have more items left. In this case,
+            # we generate the next link.
+            limit = int(limit)
+            if limit and limit == len(items):
+                return self._generate_next_link(items, id_key, request,
+                                                collection_name)
+        return []
+
+    def _generate_next_link(self, items, id_key, request,
+                            collection_name):
         links = []
-        limit = int(request.params.get("limit", 0))
-        if limit and limit == len(items):
-            last_item = items[-1]
-            if id_key in last_item:
-                last_item_id = last_item[id_key]
-            else:
-                last_item_id = last_item["id"]
-            links.append({
-                "rel": "next",
-                "href": self._get_next_link(request, last_item_id),
-            })
+        last_item = items[-1]
+        if id_key in last_item:
+            last_item_id = last_item[id_key]
+        else:
+            last_item_id = last_item["id"]
+        links.append({
+            "rel": "next",
+            "href": self._get_next_link(request, last_item_id,
+                                        collection_name),
+        })
         return links
 
     def _update_link_prefix(self, orig_url, prefix):
@@ -254,7 +353,9 @@ class ViewBuilder(object):
         url_parts = list(urlparse.urlsplit(orig_url))
         prefix_parts = list(urlparse.urlsplit(prefix))
         url_parts[0:2] = prefix_parts[0:2]
-        return urlparse.urlunsplit(url_parts)
+        url_parts[2] = prefix_parts[2] + url_parts[2]
+
+        return urlparse.urlunsplit(url_parts).rstrip('/')
 
 
 class MetadataDeserializer(wsgi.MetadataXMLDeserializer):
@@ -275,7 +376,7 @@ class MetaItemDeserializer(wsgi.MetadataXMLDeserializer):
 class MetadataXMLDeserializer(wsgi.XMLDeserializer):
 
     def extract_metadata(self, metadata_node):
-        """Marshal the metadata attribute of a parsed request"""
+        """Marshal the metadata attribute of a parsed request."""
         if metadata_node is None:
             return {}
         metadata = {}

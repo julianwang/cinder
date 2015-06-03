@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012, Intel, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,17 +16,19 @@
 Client side of the volume RPC API.
 """
 
-from oslo.config import cfg
+from oslo_config import cfg
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
-from cinder.openstack.common import jsonutils
-from cinder.openstack.common import rpc
-import cinder.openstack.common.rpc.proxy
+from cinder.objects import base as objects_base
+from cinder import rpc
+from cinder.volume import utils
 
 
 CONF = cfg.CONF
 
 
-class VolumeAPI(cinder.openstack.common.rpc.proxy.RpcProxy):
+class VolumeAPI(object):
     '''Client side of the volume rpc API.
 
     API version history:
@@ -48,137 +48,217 @@ class VolumeAPI(cinder.openstack.common.rpc.proxy.RpcProxy):
         1.10 - Add migrate_volume_completion, remove rename_volume.
         1.11 - Adds mode parameter to attach_volume()
                to support volume read-only attaching.
+        1.12 - Adds retype.
+        1.13 - Adds create_export.
+        1.14 - Adds reservation parameter to extend_volume().
+        1.15 - Adds manage_existing and unmanage_only flag to delete_volume.
+        1.16 - Removes create_export.
+        1.17 - Add replica option to create_volume, promote_replica and
+               sync_replica.
+        1.18 - Adds create_consistencygroup, delete_consistencygroup,
+               create_cgsnapshot, and delete_cgsnapshot. Also adds
+               the consistencygroup_id parameter in create_volume.
+        1.19 - Adds update_migrated_volume
+        1.20 - Adds support for sending objects over RPC in create_snapshot()
+               and delete_snapshot()
+        1.21 - Adds update_consistencygroup.
+        1.22 - Adds create_consistencygroup_from_src.
+        1.23 - Adds attachment_id to detach_volume
     '''
 
     BASE_RPC_API_VERSION = '1.0'
 
     def __init__(self, topic=None):
-        super(VolumeAPI, self).__init__(
-            topic=topic or CONF.volume_topic,
-            default_version=self.BASE_RPC_API_VERSION)
+        super(VolumeAPI, self).__init__()
+        target = messaging.Target(topic=CONF.volume_topic,
+                                  version=self.BASE_RPC_API_VERSION)
+        serializer = objects_base.CinderObjectSerializer()
+        self.client = rpc.get_client(target, '1.23', serializer=serializer)
+
+    def create_consistencygroup(self, ctxt, group, host):
+        new_host = utils.extract_host(host)
+        cctxt = self.client.prepare(server=new_host, version='1.18')
+        cctxt.cast(ctxt, 'create_consistencygroup',
+                   group_id=group['id'])
+
+    def delete_consistencygroup(self, ctxt, group):
+        host = utils.extract_host(group['host'])
+        cctxt = self.client.prepare(server=host, version='1.18')
+        cctxt.cast(ctxt, 'delete_consistencygroup',
+                   group_id=group['id'])
+
+    def update_consistencygroup(self, ctxt, group, add_volumes=None,
+                                remove_volumes=None):
+        host = utils.extract_host(group['host'])
+        cctxt = self.client.prepare(server=host, version='1.21')
+        cctxt.cast(ctxt, 'update_consistencygroup',
+                   group_id=group['id'],
+                   add_volumes=add_volumes,
+                   remove_volumes=remove_volumes)
+
+    def create_consistencygroup_from_src(self, ctxt, group, host,
+                                         cgsnapshot=None):
+        new_host = utils.extract_host(host)
+        cctxt = self.client.prepare(server=new_host, version='1.22')
+        cctxt.cast(ctxt, 'create_consistencygroup_from_src',
+                   group_id=group['id'],
+                   cgsnapshot_id=cgsnapshot['id'])
+
+    def create_cgsnapshot(self, ctxt, group, cgsnapshot):
+
+        host = utils.extract_host(group['host'])
+        cctxt = self.client.prepare(server=host, version='1.18')
+        cctxt.cast(ctxt, 'create_cgsnapshot',
+                   group_id=group['id'],
+                   cgsnapshot_id=cgsnapshot['id'])
+
+    def delete_cgsnapshot(self, ctxt, cgsnapshot, host):
+        new_host = utils.extract_host(host)
+        cctxt = self.client.prepare(server=new_host, version='1.18')
+        cctxt.cast(ctxt, 'delete_cgsnapshot',
+                   cgsnapshot_id=cgsnapshot['id'])
 
     def create_volume(self, ctxt, volume, host,
                       request_spec, filter_properties,
                       allow_reschedule=True,
                       snapshot_id=None, image_id=None,
-                      source_volid=None):
+                      source_replicaid=None,
+                      source_volid=None,
+                      consistencygroup_id=None,
+                      cgsnapshot_id=None):
 
+        new_host = utils.extract_host(host)
+        cctxt = self.client.prepare(server=new_host, version='1.4')
         request_spec_p = jsonutils.to_primitive(request_spec)
-        self.cast(ctxt,
-                  self.make_msg('create_volume',
-                                volume_id=volume['id'],
-                                request_spec=request_spec_p,
-                                filter_properties=filter_properties,
-                                allow_reschedule=allow_reschedule,
-                                snapshot_id=snapshot_id,
-                                image_id=image_id,
-                                source_volid=source_volid),
-                  topic=rpc.queue_get_for(ctxt,
-                                          self.topic,
-                                          host),
-                  version='1.4')
+        cctxt.cast(ctxt, 'create_volume',
+                   volume_id=volume['id'],
+                   request_spec=request_spec_p,
+                   filter_properties=filter_properties,
+                   allow_reschedule=allow_reschedule,
+                   snapshot_id=snapshot_id,
+                   image_id=image_id,
+                   source_replicaid=source_replicaid,
+                   source_volid=source_volid,
+                   consistencygroup_id=consistencygroup_id,
+                   cgsnapshot_id=cgsnapshot_id)
 
-    def delete_volume(self, ctxt, volume):
-        self.cast(ctxt,
-                  self.make_msg('delete_volume',
-                                volume_id=volume['id']),
-                  topic=rpc.queue_get_for(ctxt, self.topic, volume['host']))
+    def delete_volume(self, ctxt, volume, unmanage_only=False):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.15')
+        cctxt.cast(ctxt, 'delete_volume',
+                   volume_id=volume['id'],
+                   unmanage_only=unmanage_only)
 
     def create_snapshot(self, ctxt, volume, snapshot):
-        self.cast(ctxt, self.make_msg('create_snapshot',
-                                      volume_id=volume['id'],
-                                      snapshot_id=snapshot['id']),
-                  topic=rpc.queue_get_for(ctxt, self.topic, volume['host']))
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host)
+        cctxt.cast(ctxt, 'create_snapshot', volume_id=volume['id'],
+                   snapshot=snapshot)
 
     def delete_snapshot(self, ctxt, snapshot, host):
-        self.cast(ctxt, self.make_msg('delete_snapshot',
-                                      snapshot_id=snapshot['id']),
-                  topic=rpc.queue_get_for(ctxt, self.topic, host))
+        new_host = utils.extract_host(host)
+        cctxt = self.client.prepare(server=new_host)
+        cctxt.cast(ctxt, 'delete_snapshot', snapshot=snapshot)
 
     def attach_volume(self, ctxt, volume, instance_uuid, host_name,
                       mountpoint, mode):
-        return self.call(ctxt, self.make_msg('attach_volume',
-                                             volume_id=volume['id'],
-                                             instance_uuid=instance_uuid,
-                                             host_name=host_name,
-                                             mountpoint=mountpoint,
-                                             mode=mode),
-                         topic=rpc.queue_get_for(ctxt,
-                                                 self.topic,
-                                                 volume['host']),
-                         version='1.11')
 
-    def detach_volume(self, ctxt, volume):
-        return self.call(ctxt, self.make_msg('detach_volume',
-                                             volume_id=volume['id']),
-                         topic=rpc.queue_get_for(ctxt,
-                                                 self.topic,
-                                                 volume['host']))
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.11')
+        return cctxt.call(ctxt, 'attach_volume',
+                          volume_id=volume['id'],
+                          instance_uuid=instance_uuid,
+                          host_name=host_name,
+                          mountpoint=mountpoint,
+                          mode=mode)
+
+    def detach_volume(self, ctxt, volume, attachment_id):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.20')
+        return cctxt.call(ctxt, 'detach_volume', volume_id=volume['id'],
+                          attachment_id=attachment_id)
 
     def copy_volume_to_image(self, ctxt, volume, image_meta):
-        self.cast(ctxt, self.make_msg('copy_volume_to_image',
-                                      volume_id=volume['id'],
-                                      image_meta=image_meta),
-                  topic=rpc.queue_get_for(ctxt,
-                                          self.topic,
-                                          volume['host']),
-                  version='1.3')
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.3')
+        cctxt.cast(ctxt, 'copy_volume_to_image', volume_id=volume['id'],
+                   image_meta=image_meta)
 
     def initialize_connection(self, ctxt, volume, connector):
-        return self.call(ctxt, self.make_msg('initialize_connection',
-                                             volume_id=volume['id'],
-                                             connector=connector),
-                         topic=rpc.queue_get_for(ctxt,
-                                                 self.topic,
-                                                 volume['host']))
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host)
+        return cctxt.call(ctxt, 'initialize_connection',
+                          volume_id=volume['id'],
+                          connector=connector)
 
     def terminate_connection(self, ctxt, volume, connector, force=False):
-        return self.call(ctxt, self.make_msg('terminate_connection',
-                                             volume_id=volume['id'],
-                                             connector=connector,
-                                             force=force),
-                         topic=rpc.queue_get_for(ctxt,
-                                                 self.topic,
-                                                 volume['host']))
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host)
+        return cctxt.call(ctxt, 'terminate_connection', volume_id=volume['id'],
+                          connector=connector, force=force)
 
     def publish_service_capabilities(self, ctxt):
-        self.fanout_cast(ctxt, self.make_msg('publish_service_capabilities'),
-                         version='1.2')
+        cctxt = self.client.prepare(fanout=True, version='1.2')
+        cctxt.cast(ctxt, 'publish_service_capabilities')
 
     def accept_transfer(self, ctxt, volume, new_user, new_project):
-        self.cast(ctxt,
-                  self.make_msg('accept_transfer',
-                                volume_id=volume['id'],
-                                new_user=new_user,
-                                new_project=new_project),
-                  topic=rpc.queue_get_for(ctxt, self.topic, volume['host']),
-                  version='1.9')
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.9')
+        return cctxt.call(ctxt, 'accept_transfer', volume_id=volume['id'],
+                          new_user=new_user, new_project=new_project)
 
-    def extend_volume(self, ctxt, volume, new_size):
-        self.cast(ctxt,
-                  self.make_msg('extend_volume',
-                                volume_id=volume['id'],
-                                new_size=new_size),
-                  topic=rpc.queue_get_for(ctxt, self.topic, volume['host']),
-                  version='1.6')
+    def extend_volume(self, ctxt, volume, new_size, reservations):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.14')
+        cctxt.cast(ctxt, 'extend_volume', volume_id=volume['id'],
+                   new_size=new_size, reservations=reservations)
 
     def migrate_volume(self, ctxt, volume, dest_host, force_host_copy):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.8')
         host_p = {'host': dest_host.host,
                   'capabilities': dest_host.capabilities}
-        self.cast(ctxt,
-                  self.make_msg('migrate_volume',
-                                volume_id=volume['id'],
-                                host=host_p,
-                                force_host_copy=force_host_copy),
-                  topic=rpc.queue_get_for(ctxt, self.topic, volume['host']),
-                  version='1.8')
+        cctxt.cast(ctxt, 'migrate_volume', volume_id=volume['id'],
+                   host=host_p, force_host_copy=force_host_copy)
 
     def migrate_volume_completion(self, ctxt, volume, new_volume, error):
-        return self.call(ctxt,
-                         self.make_msg('migrate_volume_completion',
-                                       volume_id=volume['id'],
-                                       new_volume_id=new_volume['id'],
-                                       error=error),
-                         topic=rpc.queue_get_for(ctxt, self.topic,
-                                                 volume['host']),
-                         version='1.10')
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.10')
+        return cctxt.call(ctxt, 'migrate_volume_completion',
+                          volume_id=volume['id'],
+                          new_volume_id=new_volume['id'],
+                          error=error)
+
+    def retype(self, ctxt, volume, new_type_id, dest_host,
+               migration_policy='never', reservations=None):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.12')
+        host_p = {'host': dest_host.host,
+                  'capabilities': dest_host.capabilities}
+        cctxt.cast(ctxt, 'retype', volume_id=volume['id'],
+                   new_type_id=new_type_id, host=host_p,
+                   migration_policy=migration_policy,
+                   reservations=reservations)
+
+    def manage_existing(self, ctxt, volume, ref):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.15')
+        cctxt.cast(ctxt, 'manage_existing', volume_id=volume['id'], ref=ref)
+
+    def promote_replica(self, ctxt, volume):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.17')
+        cctxt.cast(ctxt, 'promote_replica', volume_id=volume['id'])
+
+    def reenable_replication(self, ctxt, volume):
+        new_host = utils.extract_host(volume['host'])
+        cctxt = self.client.prepare(server=new_host, version='1.17')
+        cctxt.cast(ctxt, 'reenable_replication', volume_id=volume['id'])
+
+    def update_migrated_volume(self, ctxt, volume, new_volume):
+        host = utils.extract_host(new_volume['host'])
+        cctxt = self.client.prepare(server=host, version='1.19')
+        cctxt.call(ctxt,
+                   'update_migrated_volume',
+                   volume=volume,
+                   new_volume=new_volume)

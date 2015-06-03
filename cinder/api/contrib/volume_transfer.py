@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 import webob
 from webob import exc
 
@@ -23,9 +22,8 @@ from cinder.api import extensions
 from cinder.api.openstack import wsgi
 from cinder.api.views import transfers as transfer_view
 from cinder.api import xmlutil
-
 from cinder import exception
-from cinder.openstack.common import log as logging
+from cinder.i18n import _, _LI
 from cinder import transfer as transferAPI
 from cinder import utils
 
@@ -70,7 +68,7 @@ class CreateDeserializer(wsgi.MetadataXMLDeserializer):
         transfer = {}
         transfer_node = self.find_first_child_named(node, 'transfer')
 
-        attributes = ['volume_id', 'display_name']
+        attributes = ['volume_id', 'name']
 
         for attr in attributes:
             if transfer_node.getAttribute(attr):
@@ -97,7 +95,7 @@ class AcceptDeserializer(wsgi.MetadataXMLDeserializer):
 
 
 class VolumeTransferController(wsgi.Controller):
-    """The Volume Transfer API controller for the Openstack API."""
+    """The Volume Transfer API controller for the OpenStack API."""
 
     _view_builder_class = transfer_view.ViewBuilder
 
@@ -119,7 +117,7 @@ class VolumeTransferController(wsgi.Controller):
 
     @wsgi.serializers(xml=TransfersTemplate)
     def index(self, req):
-        """Returns a summary list of transfers"""
+        """Returns a summary list of transfers."""
         return self._get_transfers(req, is_detail=False)
 
     @wsgi.serializers(xml=TransfersTemplate)
@@ -130,14 +128,18 @@ class VolumeTransferController(wsgi.Controller):
     def _get_transfers(self, req, is_detail):
         """Returns a list of transfers, transformed through view builder."""
         context = req.environ['cinder.context']
-        LOG.debug(_('Listing volume transfers'))
-        transfers = self.transfer_api.get_all(context)
+        filters = req.params.copy()
+        LOG.debug('Listing volume transfers')
+        transfers = self.transfer_api.get_all(context, filters=filters)
+        transfer_count = len(transfers)
         limited_list = common.limited(transfers, req)
 
         if is_detail:
-            transfers = self._view_builder.detail_list(req, limited_list)
+            transfers = self._view_builder.detail_list(req, limited_list,
+                                                       transfer_count)
         else:
-            transfers = self._view_builder.summary_list(req, limited_list)
+            transfers = self._view_builder.summary_list(req, limited_list,
+                                                        transfer_count)
 
         return transfers
 
@@ -146,7 +148,7 @@ class VolumeTransferController(wsgi.Controller):
     @wsgi.deserializers(xml=CreateDeserializer)
     def create(self, req, body):
         """Create a new volume transfer."""
-        LOG.debug(_('Creating new volume transfer %s'), body)
+        LOG.debug('Creating new volume transfer %s', body)
         if not self.is_valid_body(body, 'transfer'):
             raise exc.HTTPBadRequest()
 
@@ -161,9 +163,9 @@ class VolumeTransferController(wsgi.Controller):
 
         name = transfer.get('name', None)
 
-        LOG.audit(_("Creating transfer of volume %s"),
-                  volume_id,
-                  context=context)
+        LOG.info(_LI("Creating transfer of volume %s"),
+                 volume_id,
+                 context=context)
 
         try:
             new_transfer = self.transfer_api.create(context, volume_id, name)
@@ -182,7 +184,7 @@ class VolumeTransferController(wsgi.Controller):
     def accept(self, req, id, body):
         """Accept a new volume transfer."""
         transfer_id = id
-        LOG.debug(_('Accepting volume transfer %s'), transfer_id)
+        LOG.debug('Accepting volume transfer %s', transfer_id)
         if not self.is_valid_body(body, 'accept'):
             raise exc.HTTPBadRequest()
 
@@ -195,8 +197,8 @@ class VolumeTransferController(wsgi.Controller):
             msg = _("Incorrect request body format")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        LOG.audit(_("Accepting transfer %s"), transfer_id,
-                  context=context)
+        LOG.info(_LI("Accepting transfer %s"), transfer_id,
+                 context=context)
 
         try:
             accepted_transfer = self.transfer_api.accept(context, transfer_id,
@@ -216,7 +218,7 @@ class VolumeTransferController(wsgi.Controller):
         """Delete a transfer."""
         context = req.environ['cinder.context']
 
-        LOG.audit(_("Delete transfer with id: %s"), id, context=context)
+        LOG.info(_LI("Delete transfer with id: %s"), id, context=context)
 
         try:
             self.transfer_api.delete(context, transfer_id=id)
@@ -226,7 +228,7 @@ class VolumeTransferController(wsgi.Controller):
 
 
 class Volume_transfer(extensions.ExtensionDescriptor):
-    """Volume transfer management support"""
+    """Volume transfer management support."""
 
     name = "VolumeTransfer"
     alias = "os-volume-transfer"
